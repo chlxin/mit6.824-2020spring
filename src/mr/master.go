@@ -89,6 +89,7 @@ func (m *Master) server() {
 }
 
 func (m *Master) Register(args *RegisterArgs, reply *RegisterReply) error {
+	// log.Printf("receive register, args:%v", *args)
 	// 注册worker, 区分任务类型，分配任务
 	reply.MapNums = m.M
 	reply.ReduceNums = m.R
@@ -108,6 +109,7 @@ func (m *Master) Register(args *RegisterArgs, reply *RegisterReply) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	reply.TaskType = task.TaskType
+	reply.FileNames = task.InputFiles
 	workerID := m.WorkerCounter
 	m.WorkerCounter++
 	reply.WorkerID = workerID
@@ -120,11 +122,14 @@ func (m *Master) Register(args *RegisterArgs, reply *RegisterReply) error {
 		Status:       workerStatusWorking,
 	}
 	m.WorkerInfo[workerID] = worker
+	// log.Printf("register end, reply: %v", *reply)
 	return nil
 }
 
 func (m *Master) Finish(args *FinishArgs, reply *FinishReply) error {
-	if m.TaskDone == 0 {
+	// log.Printf("receive finish, args:%v", *args)
+
+	if m.TaskDone == 1 {
 		reply.Success = false
 		return nil
 	}
@@ -202,6 +207,7 @@ func (m *Master) Finish(args *FinishArgs, reply *FinishReply) error {
 	} else {
 		return fmt.Errorf("illegal argument")
 	}
+	// log.Printf("finish end, reply:%v", *reply)
 	return nil
 }
 
@@ -216,6 +222,7 @@ func (m *Master) background() {
 			fiveSecondsAgo := time.Now().Add(-5 * time.Second)
 			for _, worker := range m.WorkerInfo {
 				if worker.Status == workerStatusWorking && fiveSecondsAgo.After(worker.RegisterTime) {
+					// log.Println("cleanup")
 					worker.Status = workerStatusExpire
 					workerID := worker.WorkderID
 					taskID := m.WorkerAssignment[workerID]
@@ -244,6 +251,7 @@ func (m *Master) Done() bool {
 // create a Master.
 //
 func MakeMaster(files []string, nReduce int) *Master {
+	// log.Println(files, nReduce)
 	m := Master{}
 
 	// Your code here.
@@ -274,7 +282,10 @@ func MakeMaster(files []string, nReduce int) *Master {
 		m.TaskTodo <- task
 
 	}
-
+	m.TaskDone = 0
+	m.ReduceTaskDone = 0
+	m.DoneCh = make(chan struct{})
+	// log.Println(m.Tasks[0])
 	m.lock.Unlock()
 
 	m.server()

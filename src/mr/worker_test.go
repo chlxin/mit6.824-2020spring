@@ -3,33 +3,33 @@ package mr
 import (
 	"fmt"
 	"sort"
-	"unicode"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 func Test_process_1(t *testing.T) {
 	registerReply := &RegisterReply{
-		Finish: false,
-		WorkerID: 1,
-		TaskType: TaskTypeMap,
-		MapNums: 2,
+		Finish:     false,
+		WorkerID:   1,
+		TaskType:   TaskTypeMap,
+		MapNums:    2,
 		ReduceNums: 1,
-		FileNames: []string{"pg-tom_sawyer.txt"},
+		FileNames:  []string{"pg-tom_sawyer.txt"},
 	}
-	process(registerReply , Map, Reduce)
+	process(registerReply, Map, Reduce)
 }
 
 func Test_process_2(t *testing.T) {
 	registerReply := &RegisterReply{
-		Finish: false,
-		WorkerID: 0,
-		TaskType: TaskTypeReduce,
-		MapNums: 2,
+		Finish:     false,
+		WorkerID:   0,
+		TaskType:   TaskTypeReduce,
+		MapNums:    2,
 		ReduceNums: 1,
-		FileNames: []string{"mr-1-0", "mr-0-0"},
+		FileNames:  []string{"mr-1-0", "mr-0-0"},
 	}
-	process(registerReply , Map, Reduce)
+	process(registerReply, Map, Reduce)
 }
 
 // The mapping function is called once for each piece of the input.
@@ -55,4 +55,16 @@ func Map(document string, value string) (res []KeyValue) {
 func Reduce(key string, values []string) string {
 	sort.Strings(values)
 	return fmt.Sprintf("%d %s", len(values), strings.Join(values, ","))
+}
+
+func TestCallExample(t *testing.T) {
+	CallExample()
+}
+
+func Test_register(t *testing.T) {
+	for i := 0; i < 9; i++ {
+		res, err := register()
+		fmt.Println(res, err)
+	}
+
 }

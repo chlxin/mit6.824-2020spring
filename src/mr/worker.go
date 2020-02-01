@@ -81,7 +81,7 @@ func register() (*RegisterReply, error) {
 	args := RegisterArgs{}
 	reply := RegisterReply{}
 
-	if call("Master.Register", &args, &reply) {
+	if !call("Master.Register", &args, &reply) {
 		return nil, fmt.Errorf("register call failed")
 	}
 	return &reply, nil
