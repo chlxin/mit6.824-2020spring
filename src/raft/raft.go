@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"log"
 	"math/rand"
@@ -66,11 +67,11 @@ type LogHeader struct {
 }
 
 type LogEntry struct {
-	header  *LogHeader
+	Header  *LogHeader
 	Command interface{}
 }
 
-var emptyLogEntry = &LogEntry{header: &LogHeader{Term: -1, Index: -1}, Command: nil}
+var emptyLogEntry = &LogEntry{Header: &LogHeader{Term: -1, Index: -1}, Command: nil}
 
 //
 // A Go object implementing a single Raft peer.
@@ -185,6 +186,11 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (args RequestVoteArgs) String() string {
+	return fmt.Sprintf("Term:%d, CandidateID:%d, LastLogIndex:%d, LastLogTerm:%d",
+		args.Term, args.CandidateID, args.LastLogIndex, args.LastLogTerm)
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderID     int
@@ -192,6 +198,11 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  int         // term of prevIndex entry
 	Entries      []*LogEntry // maybe []byte is better?
 	LeaderCommit int
+}
+
+func (args AppendEntriesArgs) String() string {
+	return fmt.Sprintf("Term:%d, LeaderID:%d, prevLogIndex:%d, prevLogTerm:%d, leaderCommit:%d",
+		args.Term, args.LeaderID, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 }
 
 type AppendEntriesReply struct {
@@ -206,20 +217,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	log.Printf("me:%d, term:%d receive RequestVote, args:%s", rf.me, rf.currentTerm, args.String())
+
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
+	} else if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.becomeFollower()
 	}
-	rf.currentTerm = args.Term
+
 	// may be we don't need check role
 
 	if rf.voteFor == voteForNobody {
 		incoming := &LogHeader{Term: args.LastLogTerm, Index: args.LastLogIndex}
-		local := rf.getLastLog().header // 有问题，如果rf.logs是空就gg
+		local := rf.getLastLog().Header // 有问题，如果rf.logs是空就gg
 		if checkIncomingUpToDate(local, incoming) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
+			rf.voteFor = args.CandidateID
 		}
 	} else {
 		reply.Term = rf.currentTerm
@@ -228,21 +245,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 }
 
+// AppendEntries 心跳或者追加日志
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// log.Println("test")
 	rf.mu.Lock()
-	defer rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// log.Printf("me:%d, term:%d receive AppendEntries, args:%s", rf.me, rf.currentTerm, args.String())
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
+	} else if rf.currentTerm < args.Term {
+		rf.currentTerm = args.Term
+		rf.becomeFollower()
 	}
-	rf.currentTerm = args.Term
+
 	// 2B: checkLog
 	if args.LeaderCommit > rf.commitIndex {
 		commit := args.LeaderCommit
 		lastLog := rf.getLastLog()
-		if commit > lastLog.header.Index {
-			commit = lastLog.header.Index
+		if commit > lastLog.Header.Index {
+			commit = lastLog.Header.Index
 		}
 		rf.commitIndex = commit
 	}
@@ -360,6 +383,8 @@ func (rf *Raft) becomeFollower() {
 	if lastRole == roleLeader {
 		rf.electionCond.Signal()
 	}
+
+	log.Printf("become follower, status: %s", rf.String())
 }
 
 func (rf *Raft) becomeLeader() {
@@ -372,16 +397,18 @@ func (rf *Raft) becomeLeader() {
 	rf.lastSendAppendRPC = time.Now()
 	// 必须要唤醒心跳协程
 	rf.heartbeatCond.Signal()
+	log.Printf("become Leader, status: %s", rf.String())
 }
 
 func (rf *Raft) becomeCandidate() {
 	rf.role = roleCandidate
-	rf.voteFor = voteForNobody
+	rf.leaderID = leaderUnknown
 	rf.currentTerm++
 	rf.voteFor = rf.me
 	rf.nextIndexes = nil
 	rf.matchIndexes = nil
 	rf.lastReceiveAppendRPC = time.Now()
+	log.Printf("become Candidate, status: %s", rf.String())
 }
 
 func (rf *Raft) applier() {
@@ -404,6 +431,7 @@ Outer:
 			rf.mu.Unlock()
 			time.Sleep(interval - elapsed)
 			rf.mu.Lock()
+			elapsed = time.Now().Sub(rf.lastSendAppendRPC)
 		}
 		if rf.role != roleLeader {
 			rf.mu.Unlock()
@@ -426,15 +454,21 @@ Outer:
 		}
 
 		timeout := rf.nextElectionTimeout()
+		log.Printf("me:%d begin election, timeout:%d", rf.me, timeout.Milliseconds())
 		for elapsed := time.Now().Sub(rf.lastReceiveAppendRPC); elapsed < timeout; {
+			// log.Printf("elapsed: %d", elapsed.Milliseconds())
 			if rf.role == roleLeader {
 				rf.mu.Unlock()
 				continue Outer
 			}
 			rf.mu.Unlock()
-			time.Sleep(timeout - elapsed)
+			interval := timeout - elapsed
+			time.Sleep(interval)
+			// log.Printf("wakeup: %d", interval.Milliseconds())
 			rf.mu.Lock()
+			elapsed = time.Now().Sub(rf.lastReceiveAppendRPC)
 		}
+		log.Printf("me:%d election timeout now", rf.me)
 		// 理论上不会，不会从follower突然自己变成了leader，但是因为刚拿到锁，保险起见仍然check一下
 		if rf.role == roleLeader {
 			rf.mu.Unlock()
@@ -451,13 +485,14 @@ Outer:
 
 func (rf *Raft) execElection() {
 	rf.mu.Lock()
+	log.Printf("[debug] me:%d  execElection", rf.me)
 	lastLog := rf.getLastLog()
 	// args在后面全程不变
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateID:  rf.me,
-		LastLogIndex: lastLog.header.Index,
-		LastLogTerm:  lastLog.header.Term,
+		LastLogIndex: lastLog.Header.Index,
+		LastLogTerm:  lastLog.Header.Term,
 	}
 	peersLen := len(rf.peers)
 	count := 1
@@ -469,7 +504,7 @@ func (rf *Raft) execElection() {
 			var reply RequestVoteReply
 			ok := rf.sendRequestVote(server, args, &reply)
 			if !ok {
-				log.Printf("[debug] sendRequestVote failed")
+				// log.Printf("[debug] sendRequestVote failed")
 				return
 			}
 			rf.mu.Lock()
@@ -486,8 +521,10 @@ func (rf *Raft) execElection() {
 			}
 			half := len(rf.peers)/2 + 1
 			if reply.VoteGranted {
+				log.Printf("[debug] me:%d ,term :%d got vote from server:%d", rf.me, rf.currentTerm, server)
 				*count++
 				if *count == half {
+					log.Printf("[debug] me:%d, term :%d  got half:%d vote, become leader", rf.me, rf.currentTerm, half)
 					rf.becomeLeader()
 				}
 			}
@@ -499,6 +536,7 @@ func (rf *Raft) execElection() {
 
 func (rf *Raft) execHeartbeat() {
 	rf.mu.Lock()
+	// log.Println("[debug] execHeartbeat")
 	peersLen := len(rf.peers)
 
 	for i := 0; i < peersLen; i++ {
@@ -518,9 +556,10 @@ func (rf *Raft) execHeartbeat() {
 				LeaderCommit: commitIndex,
 			}
 			var reply AppendEntriesReply
+			// log.Printf("me:%d sendAppendEntries to remote:%d", rf.me, server)
 			ok := rf.sendAppendEntries(server, args, &reply)
 			if !ok {
-				log.Printf("[debug] sendAppendEntries failed")
+				// log.Printf("[debug] sendAppendEntries failed")
 				return
 			}
 			rf.mu.Lock()
@@ -532,7 +571,7 @@ func (rf *Raft) execHeartbeat() {
 			}
 			if rf.role != roleLeader {
 				// 可能已经变成follower，也可能是之前已经成为了leader
-				log.Printf("[debug] rf role is not roleLeader")
+				log.Printf("[debug] me:%d rf role is not roleLeaderrf role is not roleLeader", rf.me)
 				return
 			}
 			// TODO: 需要补充来更新matchIndex和nextIndex
@@ -550,7 +589,12 @@ func (rf *Raft) nextElectionTimeout() time.Duration {
 	rand.Seed(time.Now().Unix())
 	rtimeout := rand.Int63n(timeout)
 
-	return time.Duration(rtimeout) * time.Millisecond
+	return time.Duration(rf.ElectionTimeoutMin+rtimeout) * time.Millisecond
+}
+
+func (rf *Raft) String() string {
+	return fmt.Sprintf("term: %d, me: %d, voteFor:%d, leaderID:%d, role:%d",
+		rf.currentTerm, rf.me, rf.voteFor, rf.leaderID, rf.role)
 }
 
 //
@@ -576,9 +620,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionCond = sync.NewCond(&rf.mu)
 	rf.heartbeatCond = sync.NewCond(&rf.mu)
 	rf.leaderID = leaderUnknown
-	rf.ElectionTimeoutMin = 200
-	rf.ElectionTimeoutMax = 400
-	rf.HeartbeatInterval = 50
+	rf.ElectionTimeoutMin = 100
+	rf.ElectionTimeoutMax = 200
+	rf.HeartbeatInterval = 10
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
