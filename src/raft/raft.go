@@ -201,8 +201,8 @@ func (rl *RaftLog) AppendLogs(prevLogIndex int, prevLogTerm int, entries []*LogE
 		log.Fatalf("consistentCheck not pass")
 	}
 
-	DEBUG("[debug] AppendLogs prevLogIndex:%d, prevLogTerm:%d, local:%s, incomings:%s",
-		prevLogIndex, prevLogTerm, ENTRIES_STRING(rl.entries), ENTRIES_STRING(entries))
+	DEBUG("me:%d AppendLogs prevLogIndex:%d, prevLogTerm:%d, local:%s, incomings:%s",
+		rl.onwer, prevLogIndex, prevLogTerm, ENTRIES_STRING(rl.entries), ENTRIES_STRING(entries))
 
 	// 到这里说明prevLogIndex在entries能找到，并且term也一致，因此直接删除之后的日志
 	rl.entries = rl.entries[:prevLogIndex+1]
@@ -409,6 +409,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		incoming := &LogEntry{Term: args.LastLogTerm, Index: args.LastLogIndex}
 		local := rf.logs.GetLastLog()
 		if checkIncomingUpToDate(local, incoming) {
+			DEBUG("me:%d, term:%d give the vote to [%d], local:%s, incoming:%s",
+				rf.me, rf.currentTerm, args.CandidateID, ENTRY_STRING(local), ENTRY_STRING(incoming))
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.voteFor = args.CandidateID
@@ -439,7 +441,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastReceiveAppendRPC = time.Now() // important
 
 	if !rf.logs.CanAppend(args.PrevLogIndex, args.PrevLogTerm) {
-		DEBUG("[debug] me:%d term:%d prevLogIndex:%d prevLogTerm:%d consistent check not pass",
+		DEBUG("me:%d term:%d prevLogIndex:%d prevLogTerm:%d consistent check not pass",
 			rf.me, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
 		reply.Success = false
 		return
@@ -581,7 +583,7 @@ func (rf *Raft) becomeFollower(leaderID int) {
 		rf.electionCond.Signal()
 	}
 
-	DEBUG("become follower, status: %s", rf.String())
+	DEBUG("me:%d become follower, status: %s", rf.me, rf.String())
 }
 
 func (rf *Raft) becomeLeader() {
@@ -600,7 +602,7 @@ func (rf *Raft) becomeLeader() {
 	rf.heartbeatCond.Signal()
 	entries := rf.logs.GetEntries()
 	bs, _ := json.Marshal(entries)
-	DEBUG("become Leader, status: %s, logs:%s, commitIndex:%d", rf.String(), string(bs), rf.commitIndex)
+	DEBUG("me:%d become Leader, status: %s, logs:%s", rf.me, rf.String(), string(bs))
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -611,7 +613,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.nextIndexes = nil
 	rf.matchIndexes = nil
 	rf.lastReceiveAppendRPC = time.Now()
-	DEBUG("become Candidate, status: %s", rf.String())
+	DEBUG("me:%d become Candidate, status: %s", rf.me, rf.String())
 }
 
 func (rf *Raft) applier() {
@@ -634,7 +636,8 @@ func (rf *Raft) applier() {
 				rf.mu.Unlock()
 				continue
 			}
-			DEBUG("me:%d, term:%d apply message len:%d", rf.me, rf.currentTerm, len(applyLogs))
+			DEBUG("me:%d, term:%d apply message index[%d-%d]",
+				rf.me, rf.currentTerm, applyLogs[0].Index, applyLogs[len(applyLogs)-1].Index)
 		}
 		rf.mu.Unlock()
 		if len(applyLogs) > 0 {
@@ -654,7 +657,7 @@ func (rf *Raft) applier() {
 }
 
 func (rf *Raft) heartbeat() {
-	// times := 0
+	times := 0
 Outer:
 	for {
 		rf.mu.Lock()
@@ -677,15 +680,15 @@ Outer:
 			continue
 		}
 		rf.lastSendAppendRPC = time.Now()
-		// times++
-		// log.Printf("me:%d, appendEntries times:%d", rf.me, times)
+		times++
+		DEBUG("me:%d, appendEntries times:%d", rf.me, times)
 		go rf.execHeartbeat()
 		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) election() {
-	// times := 0
+	times := 0
 Outer:
 	for {
 		// TODO: 需要检查raft应用是不是已经kill了
@@ -708,19 +711,19 @@ Outer:
 			time.Sleep(interval)
 			rf.mu.Lock()
 			elapsed = time.Now().Sub(rf.lastReceiveAppendRPC)
-			DEBUG("%d wakeup: %d, %d, %v", rf.me, elapsed.Milliseconds(), timeout.Milliseconds(), elapsed < timeout)
+			// DEBUG("%d wakeup: %d, %d, %v", rf.me, elapsed.Milliseconds(), timeout.Milliseconds(), elapsed < timeout)
 		}
 		// candidate到这里可能就发现自己是leader了
 		if rf.role == roleLeader {
 			rf.mu.Unlock()
 			continue
 		}
-		DEBUG("me:%d, role:%d election timeout now", rf.me, rf.role)
+		DEBUG("me:%d, role:%d election timeout now, ready to become candidiate", rf.me, rf.role)
 		// still hold lock
 		// 到这里就已经选举超时了
 		rf.becomeCandidate()
-		// times++
-		// log.Printf("me:%d, election times:%d", rf.me, times)
+		times++
+		DEBUG("me:%d term:%d, election times:%d", rf.me, rf.currentTerm, times)
 		go rf.execElection()
 		rf.mu.Unlock()
 	}
@@ -728,7 +731,7 @@ Outer:
 
 func (rf *Raft) execElection() {
 	rf.mu.Lock()
-	DEBUG("[debug] me:%d  execElection", rf.me)
+	// DEBUG("[debug] me:%d  execElection", rf.me)
 	lastLog := rf.logs.GetLastLog()
 	// args在后面全程不变
 	args := &RequestVoteArgs{
@@ -750,8 +753,10 @@ func (rf *Raft) execElection() {
 				// DEBUG("[debug] sendRequestVote failed")
 				return
 			}
+
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.becomeFollower(leaderUnknown)
@@ -759,15 +764,15 @@ func (rf *Raft) execElection() {
 			}
 			if rf.role != roleCandidate {
 				// 可能已经变成follower，也可能是之前已经成为了leader
-				DEBUG("[debug] rf role is not roleCandidate")
+				DEBUG("me:%d term:%d rf role is no longer roleCandidate", rf.me, rf.currentTerm)
 				return
 			}
 			half := len(rf.peers)/2 + 1
 			if reply.VoteGranted {
-				DEBUG("[debug] me:%d ,term :%d got vote from server:%d", rf.me, rf.currentTerm, server)
+				DEBUG("me:%d ,term :%d got vote from server:%d", rf.me, rf.currentTerm, server)
 				*count++
 				if *count == half {
-					DEBUG("[debug] me:%d, term :%d  got half:%d vote, become leader", rf.me, rf.currentTerm, half)
+					DEBUG("me:%d, term :%d  got half:%d vote, become leader", rf.me, rf.currentTerm, half)
 					rf.becomeLeader()
 				}
 			}
@@ -837,7 +842,7 @@ func (rf *Raft) execHeartbeat() {
 				}
 				if rf.role != roleLeader {
 					// 可能已经变成follower，也可能是之前已经成为了leader
-					DEBUG("[debug] me:%d rf role is not roleLeaderf role is not roleLeader", rf.me)
+					DEBUG("me:%d term:%d rf role is no longer roleLeader", rf.me, rf.currentTerm)
 					rf.mu.Unlock()
 					return
 				}
@@ -922,9 +927,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionCond = sync.NewCond(&rf.mu)
 	rf.heartbeatCond = sync.NewCond(&rf.mu)
 	rf.leaderID = leaderUnknown
-	rf.ElectionTimeoutMin = 1000
-	rf.ElectionTimeoutMax = 1400
-	rf.HeartbeatInterval = 100
+	rf.ElectionTimeoutMin = 700
+	rf.ElectionTimeoutMax = 1100
+	rf.HeartbeatInterval = 70
 	rf.logs = NewRaftLog(me)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
