@@ -11,6 +11,11 @@ const (
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	// fd, err := os.Create("o2.log")
+	// if err != nil {
+	// 	log.Fatalf("os.create failed: %v", err)
+	// }
+	// log.SetOutput(fd)
 }
 
 // DEBUG 辅助打印日志

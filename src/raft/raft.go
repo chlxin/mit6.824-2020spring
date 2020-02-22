@@ -400,7 +400,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	} else if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
-		rf.becomeFollower(leaderUnknown)
+		rf.becomeFollower(leaderUnknown, false)
 	}
 
 	// may be we don't need check role
@@ -414,6 +414,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.voteFor = args.CandidateID
+			rf.lastReceiveAppendRPC = time.Now() // only give the vote can reset the timer
 		}
 	} else {
 		reply.Term = rf.currentTerm
@@ -433,12 +434,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
-	} else {
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.becomeFollower(args.LeaderID)
 	}
-	rf.lastReceiveAppendRPC = time.Now() // important
+	rf.currentTerm = args.Term
+	reply.Term = rf.currentTerm
+	rf.becomeFollower(args.LeaderID, true)
 
 	if !rf.logs.CanAppend(args.PrevLogIndex, args.PrevLogTerm) {
 		DEBUG("me:%d term:%d prevLogIndex:%d prevLogTerm:%d consistent check not pass",
@@ -569,7 +568,7 @@ func (rf *Raft) killed() bool {
 }
 
 // 必须要持有rf.mu的锁才可以调用
-func (rf *Raft) becomeFollower(leaderID int) {
+func (rf *Raft) becomeFollower(leaderID int, resetTime bool) {
 	lastRole := rf.role
 
 	rf.role = roleFollower
@@ -577,7 +576,9 @@ func (rf *Raft) becomeFollower(leaderID int) {
 	rf.voteFor = voteForNobody
 	rf.nextIndexes = nil
 	rf.matchIndexes = nil
-	rf.lastReceiveAppendRPC = time.Now()
+	if resetTime {
+		rf.lastReceiveAppendRPC = time.Now()
+	}
 	// 如果从leader变成follower，必须要唤醒选举协程
 	if lastRole == roleLeader {
 		rf.electionCond.Signal()
@@ -699,8 +700,9 @@ Outer:
 		}
 
 		timeout := rf.nextElectionTimeout()
+		elapsed := time.Now().Sub(rf.lastReceiveAppendRPC)
 		// DEBUG("me:%d begin election, timeout:%d", rf.me, timeout.Milliseconds())
-		for elapsed := time.Now().Sub(rf.lastReceiveAppendRPC); elapsed < timeout; {
+		for elapsed < timeout {
 			// DEBUG("elapsed: %d", elapsed.Milliseconds())
 			if rf.role == roleLeader {
 				rf.mu.Unlock()
@@ -710,6 +712,7 @@ Outer:
 			interval := timeout - elapsed
 			time.Sleep(interval)
 			rf.mu.Lock()
+			timeout = rf.nextElectionTimeout()
 			elapsed = time.Now().Sub(rf.lastReceiveAppendRPC)
 			// DEBUG("%d wakeup: %d, %d, %v", rf.me, elapsed.Milliseconds(), timeout.Milliseconds(), elapsed < timeout)
 		}
@@ -759,7 +762,7 @@ func (rf *Raft) execElection() {
 
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
-				rf.becomeFollower(leaderUnknown)
+				rf.becomeFollower(leaderUnknown, false)
 				return
 			}
 			if rf.role != roleCandidate {
@@ -836,7 +839,7 @@ func (rf *Raft) execHeartbeat() {
 
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
-					rf.becomeFollower(leaderUnknown)
+					rf.becomeFollower(leaderUnknown, true)
 					rf.mu.Unlock()
 					return
 				}
@@ -889,6 +892,7 @@ func (rf *Raft) execHeartbeat() {
 }
 
 func (rf *Raft) nextElectionTimeout() time.Duration {
+	rand.Seed(time.Now().Unix())
 	timeout := rf.ElectionTimeoutMax - rf.ElectionTimeoutMin
 	if timeout <= 0 {
 		log.Fatalf("illegal timeout, %d, %d", rf.ElectionTimeoutMin, rf.ElectionTimeoutMax)
@@ -927,9 +931,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionCond = sync.NewCond(&rf.mu)
 	rf.heartbeatCond = sync.NewCond(&rf.mu)
 	rf.leaderID = leaderUnknown
-	rf.ElectionTimeoutMin = 700
-	rf.ElectionTimeoutMax = 1100
-	rf.HeartbeatInterval = 70
+	rf.ElectionTimeoutMin = 800
+	rf.ElectionTimeoutMax = 1400
+	rf.HeartbeatInterval = 80
 	rf.logs = NewRaftLog(me)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -939,7 +943,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.election()
 	go rf.heartbeat()
 	go rf.applier()
-	rf.becomeFollower(leaderUnknown)
+	rf.becomeFollower(leaderUnknown, true)
 	rf.mu.Unlock()
 	return rf
 }
