@@ -5,8 +5,8 @@ import (
 	"log"
 )
 
-const (
-	debug = false
+var (
+	debug = int64(0)
 )
 
 func init() {
@@ -20,7 +20,7 @@ func init() {
 
 // DEBUG 辅助打印日志
 func DEBUG(fmt string, args ...interface{}) {
-	if debug {
+	if debug == 1 {
 		log.Printf(fmt, args...)
 	}
 }
@@ -36,7 +36,7 @@ func ENTRIES_STRING(entries []*LogEntry) string {
 }
 
 func CHECK_LOGS(entries []*LogEntry) {
-	if !debug {
+	if debug == 0 {
 		return
 	}
 	var (

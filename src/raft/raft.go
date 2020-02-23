@@ -18,8 +18,10 @@ package raft
 //
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"labgob"
 	"labrpc"
 	"log"
 	"math/rand"
@@ -44,6 +46,11 @@ const (
 
 const (
 	leaderUnknown = -1
+)
+
+const (
+	peerStatusReplcated  = 0
+	peerStatusReplcating = 1
 )
 
 var (
@@ -103,13 +110,24 @@ type RaftLog struct {
 	entries   []*LogEntry
 }
 
-func NewRaftLog(owner int) *RaftLog {
+func NewRaftLog(owner int, logs []*LogEntry) *RaftLog {
 	initEntries := make([]*LogEntry, 0)
-	initEntries = append(initEntries, emptyLogEntry)
+
+	if len(logs) == 0 {
+		initEntries = append(initEntries, emptyLogEntry)
+	} else {
+		initEntries = append(initEntries, logs...)
+		CHECK_LOGS(initEntries)
+	}
+
+	e := initEntries[len(initEntries)-1]
+	lastIndex := e.Index
+	lastTerm := e.Term
+
 	return &RaftLog{
 		onwer:     owner,
-		LastIndex: 0,
-		LastTerm:  0,
+		LastIndex: lastIndex,
+		LastTerm:  lastTerm,
 		entries:   initEntries, // 初始长度为1，因为0元素为空
 	}
 }
@@ -196,13 +214,13 @@ func (rl *RaftLog) AppendLogs(prevLogIndex int, prevLogTerm int, entries []*LogE
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-
-	if !rl.consistentCheck(prevLogIndex, prevLogTerm) {
+	checkRes := rl.consistentCheck(prevLogIndex, prevLogTerm)
+	if !checkRes.Success {
 		log.Fatalf("consistentCheck not pass")
 	}
 
-	DEBUG("me:%d AppendLogs prevLogIndex:%d, prevLogTerm:%d, local:%s, incomings:%s",
-		rl.onwer, prevLogIndex, prevLogTerm, ENTRIES_STRING(rl.entries), ENTRIES_STRING(entries))
+	// DEBUG("me:%d AppendLogs prevLogIndex:%d, prevLogTerm:%d, local:%s, incomings:%s",
+	// rl.onwer, prevLogIndex, prevLogTerm, ENTRIES_STRING(rl.entries), ENTRIES_STRING(entries))
 
 	// 到这里说明prevLogIndex在entries能找到，并且term也一致，因此直接删除之后的日志
 	rl.entries = rl.entries[:prevLogIndex+1]
@@ -215,27 +233,62 @@ func (rl *RaftLog) AppendLogs(prevLogIndex int, prevLogTerm int, entries []*LogE
 	return nil
 }
 
-func (rl *RaftLog) CanAppend(prevLogIndex int, prevLogTerm int) bool {
+func (rl *RaftLog) ConsistentCheck(prevLogIndex int, prevLogTerm int) *consistentCheckResult {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
 	return rl.consistentCheck(prevLogIndex, prevLogTerm)
 }
 
 // consistentCheck raft日志的一致性检查，必须持有锁的情况下调用
-func (rl *RaftLog) consistentCheck(prevLogIndex int, prevLogTerm int) bool {
+func (rl *RaftLog) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCheckResult {
+	res := &consistentCheckResult{}
 	index := rl.calculateIndex(prevLogIndex)
 	if index >= len(rl.entries) {
-		return false
+		// 本地没有该index的日志
+		res.Success = false
+		res.Conflict = false
+		lastLog := rl.entries[len(rl.entries)-1]
+		res.ConflictIndex = lastLog.Index
+		res.ConflictTerm = lastLog.Term
+		return res
 	}
 	e := rl.entries[index]
 	if e.Term == prevLogTerm {
-		return true
+		res.Success = true
+		return res
 	}
-	return false
+
+	res.Success = false
+	res.Conflict = true
+	// e.Index一定>=1,假如是0上面就返回success了
+	// 因此下面代码至少会走一次，如果是1，那么一定会设置res(因为index为0，term为0，其他的log的term一定大于0)。也就是说下面的if至少会走一次
+	for i := e.Index; i >= 1; i-- {
+		if rl.entries[i-1].Term != e.Term {
+			res.ConflictIndex = rl.entries[i].Index
+			res.ConflictTerm = rl.entries[i].Term
+		}
+	}
+	// 确保到这里ConflictIndex肯定大于0
+	if res.ConflictIndex == 0 || res.ConflictTerm == 0 {
+		log.Fatalf("illegal state")
+	}
+	return res
 }
 
 func (rl *RaftLog) calculateIndex(index int) int {
 	return index
+}
+
+type consistentCheckResult struct {
+	Success       bool
+	Conflict      bool
+	ConflictIndex int
+	ConflictTerm  int
+}
+
+func (c consistentCheckResult) String() string {
+	return fmt.Sprintf("Success:%v, Conflict:%v, ConflictIndex:%d, ConflictTerm:%d",
+		c.Success, c.Conflict, c.ConflictIndex, c.ConflictTerm)
 }
 
 //
@@ -273,7 +326,7 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 	// volatile state on leader
-	nextIndexes  []int // TODO: maybe struct is better? depend on if there are other information to store
+	nextIndexes  []int
 	matchIndexes []int
 }
 
@@ -306,6 +359,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.logs.GetEntries())
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -313,6 +373,7 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		rf.logs = NewRaftLog(rf.me, []*LogEntry{})
 		return
 	}
 	// Your code here (2C).
@@ -328,6 +389,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var (
+		term int
+		logs []*LogEntry
+	)
+
+	if d.Decode(&term) != nil ||
+		d.Decode(&logs) != nil {
+		log.Fatalf("readPersist failed, decode error")
+	} else {
+		rf.currentTerm = term
+		rf.logs = NewRaftLog(rf.me, logs)
+	}
+
 }
 
 //
@@ -373,8 +450,11 @@ func (args AppendEntriesArgs) String() string {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	Conflict      bool // 假如Success返回false，那么会返回，来告诉是否log存在冲突
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // var (
@@ -439,10 +519,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.becomeFollower(args.LeaderID, true)
 
-	if !rf.logs.CanAppend(args.PrevLogIndex, args.PrevLogTerm) {
-		DEBUG("me:%d term:%d prevLogIndex:%d prevLogTerm:%d consistent check not pass",
-			rf.me, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
+	checkRes := rf.logs.ConsistentCheck(args.PrevLogIndex, args.PrevLogTerm)
+	if !checkRes.Success {
+		DEBUG("me:%d term:%d prevLogIndex:%d prevLogTerm:%d consistent check not pass, checkRes:%v",
+			rf.me, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm, checkRes)
 		reply.Success = false
+		reply.Conflict = checkRes.Conflict
+		reply.ConflictIndex = checkRes.ConflictIndex
+		reply.ConflictTerm = checkRes.ConflictTerm
 		return
 	}
 	err := rf.logs.AppendLogs(args.PrevLogIndex, args.PrevLogTerm, args.Entries)
@@ -450,6 +534,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if err != nil {
 		log.Fatalf("AppendEntries failed, cause of AppendLogs failed")
 	}
+	rf.persist()
 
 	// DEBUG("[debug] me:%d term:%d reply yes", rf.me, rf.currentTerm)
 	reply.Success = true
@@ -461,6 +546,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			commit = lastLog.Index
 		}
 
+		if rf.commitIndex > commit {
+			log.Fatalf("commitIndex back")
+		}
 		rf.commitIndex = commit
 		DEBUG("me:%d, term:%d passivity commit message commitID:%d. now commitIndex:%d", rf.me, rf.currentTerm, commit, rf.commitIndex)
 	}
@@ -537,6 +625,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if err != nil {
 			log.Fatalf("[error] Start.AppendLog failed, err:%v", err)
 		}
+		rf.persist()
 		rf.matchIndexes[rf.me] = index // 自己的match值永远最新
 		DEBUG("me:%d term:%d start success index:%d", rf.me, rf.currentTerm, index)
 	} else {
@@ -622,7 +711,10 @@ func (rf *Raft) applier() {
 	DEBUG("me:%d term:%d start applier", rf.me, rf.currentTerm)
 	rf.mu.Unlock()
 	for {
-		time.Sleep(300 * time.Millisecond)
+		if rf.killed() {
+			return
+		}
+		time.Sleep(90 * time.Millisecond)
 		rf.mu.Lock()
 		var (
 			applyLogs []*LogEntry
@@ -661,6 +753,9 @@ func (rf *Raft) heartbeat() {
 	times := 0
 Outer:
 	for {
+		if rf.killed() {
+			return
+		}
 		rf.mu.Lock()
 		for rf.role != roleLeader {
 			rf.heartbeatCond.Wait()
@@ -692,7 +787,10 @@ func (rf *Raft) election() {
 	times := 0
 Outer:
 	for {
-		// TODO: 需要检查raft应用是不是已经kill了
+		if rf.killed() {
+			return
+		}
+
 		rf.mu.Lock()
 
 		for rf.role == roleLeader {
@@ -794,105 +892,125 @@ func (rf *Raft) execHeartbeat() {
 		if i == rf.me {
 			continue
 		}
-		go func(rf *Raft, server int, me int) {
-			retry := true
-			for retry {
-				rf.mu.Lock()
-				if rf.role != roleLeader {
-					rf.mu.Unlock()
-					return
-				}
-				nextIndex := rf.nextIndexes[server]
-				lastLog := rf.logs.GetLastLog()
-				var (
-					entries []*LogEntry
-					err     error
-				)
-				immediatelyNewIndex := lastLog.Index + 1
-				entries, err = rf.logs.GetLogBetweenIndexes(nextIndex-1, immediatelyNewIndex)
-				if err != nil {
-					DEBUG("[ERROR] GetLogBetweenIndexes err:%v, nextIndex:%d, immediatelyNewIndex:%d",
-						err, nextIndex, immediatelyNewIndex)
-					rf.mu.Unlock()
-					return
-				}
-				fe := entries[0]
-				entries = entries[1:]
-
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderID:     me,
-					PrevLogIndex: fe.Index,
-					PrevLogTerm:  fe.Term,
-					Entries:      entries,
-					LeaderCommit: rf.commitIndex,
-				}
-				rf.mu.Unlock()
-				var reply AppendEntriesReply
-				// DEBUG("me:%d sendAppendEntries to remote:%d", rf.me, server)
-				ok := rf.sendAppendEntries(server, args, &reply)
-				if !ok {
-					// DEBUG("[debug] sendAppendEntries failed")
-					return
-				}
-				rf.mu.Lock()
-
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.becomeFollower(leaderUnknown, true)
-					rf.mu.Unlock()
-					return
-				}
-				if rf.role != roleLeader {
-					// 可能已经变成follower，也可能是之前已经成为了leader
-					DEBUG("me:%d term:%d rf role is no longer roleLeader", rf.me, rf.currentTerm)
-					rf.mu.Unlock()
-					return
-				}
-
-				if reply.Success {
-					retry = false
-					rf.matchIndexes[server] = lastLog.Index
-					rf.nextIndexes[server] = lastLog.Index + 1
-					// set commit index
-					matches := make([]int, len(rf.matchIndexes))
-					copy(matches, rf.matchIndexes)
-					sort.Ints(matches)
-					c := matches[len(matches)/2]
-
-					if c > rf.commitIndex {
-						ce, err := rf.logs.GetLogByIndex(c)
-						if err != nil {
-							log.Fatalf("GetLogByIndex failed:%v", err)
-						}
-						// leader不能commit不属于自己term的日志
-						if ce.Term != rf.currentTerm {
-							DEBUG("me:%d, term:%d cannot commit index:%d, ce.Term:%v", rf.me, rf.currentTerm, c, ce.Term)
-						} else {
-							DEBUG("me:%d, term:%d commit message commitID:%d", rf.me, rf.currentTerm, c)
-							rf.commitIndex = c
-						}
-					}
-
-					// DEBUG("matches:%v, c:%d", matches, c)
-				} else {
-					// log.Printf("me%d, term:%d retry send to server:%d", rf.me, rf.currentTerm, server)
-					retry = true
-					if rf.nextIndexes[server] > 1 {
-						rf.nextIndexes[server]--
-					}
-				}
-				rf.mu.Unlock()
-
-			}
-
-		}(rf, i, rf.me)
+		go rf.sendLogsToOtherServerfunc(i, rf.me)
 	}
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) sendLogsToOtherServerfunc(server int, me int) {
+	retry := true
+	for retry {
+		rf.mu.Lock()
+		if rf.role != roleLeader {
+			rf.mu.Unlock()
+			return
+		}
+		nextIndex := rf.nextIndexes[server]
+		lastLog := rf.logs.GetLastLog()
+		var (
+			entries []*LogEntry
+			err     error
+		)
+		immediatelyNewIndex := lastLog.Index + 1
+		entries, err = rf.logs.GetLogBetweenIndexes(nextIndex-1, immediatelyNewIndex)
+		if err != nil {
+			DEBUG("[ERROR] GetLogBetweenIndexes err:%v, nextIndex:%d, immediatelyNewIndex:%d",
+				err, nextIndex, immediatelyNewIndex)
+			rf.mu.Unlock()
+			return
+		}
+		fe := entries[0]
+		entries = entries[1:]
+
+		args := &AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderID:     me,
+			PrevLogIndex: fe.Index,
+			PrevLogTerm:  fe.Term,
+			Entries:      entries,
+			LeaderCommit: rf.commitIndex,
+		}
+
+		rf.mu.Unlock()
+		var reply AppendEntriesReply
+		// DEBUG("me:%d sendAppendEntries to remote:%d", rf.me, server)
+		ok := rf.sendAppendEntries(server, args, &reply)
+		if !ok {
+			// DEBUG("[debug] sendAppendEntries failed")
+			return
+		}
+		rf.mu.Lock()
+
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.becomeFollower(leaderUnknown, true)
+			rf.mu.Unlock()
+			return
+		}
+		if rf.role != roleLeader {
+			// 可能已经变成follower，也可能是之前已经成为了leader
+			DEBUG("me:%d term:%d rf role is no longer roleLeader", rf.me, rf.currentTerm)
+			rf.mu.Unlock()
+			return
+		}
+
+		if reply.Success {
+			retry = false
+			rf.matchIndexes[server] = lastLog.Index
+			rf.nextIndexes[server] = lastLog.Index + 1
+			// set commit index
+			matches := make([]int, len(rf.matchIndexes))
+			copy(matches, rf.matchIndexes)
+			sort.Ints(matches)
+			c := matches[len(matches)/2]
+
+			if c > rf.commitIndex {
+				ce, err := rf.logs.GetLogByIndex(c)
+				if err != nil {
+					log.Fatalf("GetLogByIndex failed:%v", err)
+				}
+				// leader不能commit不属于自己term的日志
+				if ce.Term != rf.currentTerm {
+					DEBUG("me:%d, term:%d cannot commit index:%d, ce.Term:%v", rf.me, rf.currentTerm, c, ce.Term)
+				} else {
+					DEBUG("me:%d, term:%d commit message commitID:%d", rf.me, rf.currentTerm, c)
+					if rf.commitIndex > c {
+						log.Fatalf("commitIndex back")
+					}
+					rf.commitIndex = c
+				}
+			}
+
+			// DEBUG("matches:%v, c:%d", matches, c)
+		} else {
+			// log.Printf("me%d, term:%d retry send to server:%d", rf.me, rf.currentTerm, server)
+			retry = true
+			if reply.Conflict {
+				if reply.ConflictIndex == rf.nextIndexes[server] {
+					// 如果找到的冲突的term最小的index就是，当前的next，那么就减少nextIndexes
+					if rf.nextIndexes[server] > 1 { // 代码到这，这是肯定能保证的，一定为true
+						rf.nextIndexes[server]--
+					}
+				} else {
+					// 说明conflictIndex比rf.nextIndexes小
+					rf.nextIndexes[server] = reply.ConflictIndex
+				}
+
+			} else {
+				rf.nextIndexes[server] = reply.ConflictIndex + 1
+			}
+			// if rf.nextIndexes[server] > 1 {
+			// 	rf.nextIndexes[server]--
+			// }
+		}
+		rf.mu.Unlock()
+
+	}
+
+}
+
 func (rf *Raft) nextElectionTimeout() time.Duration {
-	rand.Seed(time.Now().Unix())
+	// rand.Seed(time.Now().Unix())
 	timeout := rf.ElectionTimeoutMax - rf.ElectionTimeoutMin
 	if timeout <= 0 {
 		log.Fatalf("illegal timeout, %d, %d", rf.ElectionTimeoutMin, rf.ElectionTimeoutMax)
@@ -904,8 +1022,8 @@ func (rf *Raft) nextElectionTimeout() time.Duration {
 }
 
 func (rf *Raft) String() string {
-	return fmt.Sprintf("term: %d, me: %d, voteFor:%d, leaderID:%d, role:%d, commitIndex:%d",
-		rf.currentTerm, rf.me, rf.voteFor, rf.leaderID, rf.role, rf.commitIndex)
+	return fmt.Sprintf("term: %d, me: %d, voteFor:%d, leaderID:%d, role:%d, commitIndex:%d, logs:%s",
+		rf.currentTerm, rf.me, rf.voteFor, rf.leaderID, rf.role, rf.commitIndex, ENTRY_STRING(rf.logs.GetLastLog()))
 }
 
 //
@@ -931,10 +1049,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionCond = sync.NewCond(&rf.mu)
 	rf.heartbeatCond = sync.NewCond(&rf.mu)
 	rf.leaderID = leaderUnknown
-	rf.ElectionTimeoutMin = 800
-	rf.ElectionTimeoutMax = 1400
-	rf.HeartbeatInterval = 80
-	rf.logs = NewRaftLog(me)
+	rf.ElectionTimeoutMin = 400
+	rf.ElectionTimeoutMax = 600
+	rf.HeartbeatInterval = 50
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
