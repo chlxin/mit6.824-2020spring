@@ -200,7 +200,7 @@ func (m *Master) Finish(args *FinishArgs, reply *FinishReply) error {
 					log.Fatalf("os rename failed, filename:%v, err:%v", filename, err)
 				}
 			}
-			
+
 			atomic.StoreInt64(&m.TaskDone, 1)
 			close(m.DoneCh)
 		}

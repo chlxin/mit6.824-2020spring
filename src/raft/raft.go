@@ -75,6 +75,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type LogEntry struct {
@@ -671,6 +672,7 @@ func (rf *Raft) becomeFollower(leaderID int, resetTime bool) {
 	// 如果从leader变成follower，必须要唤醒选举协程
 	if lastRole == roleLeader {
 		rf.electionCond.Signal()
+		go rf.notifyStepDown()
 	}
 
 	DEBUG("me:%d become follower, status: %s", rf.me, rf.String())
@@ -692,7 +694,17 @@ func (rf *Raft) becomeLeader() {
 	rf.heartbeatCond.Signal()
 	entries := rf.logs.GetEntries()
 	bs, _ := json.Marshal(entries)
+
+	go rf.notifyBecomeLeader()
 	DEBUG("me:%d become Leader, status: %s, logs:%s", rf.me, rf.String(), string(bs))
+}
+
+func (rf *Raft) notifyBecomeLeader() {
+	rf.applyCh <- ApplyMsg{CommandValid: false, Command: "becomeLeader"}
+}
+
+func (rf *Raft) notifyStepDown() {
+	rf.applyCh <- ApplyMsg{CommandValid: false, Command: "stepdown"}
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -739,6 +751,7 @@ func (rf *Raft) applier() {
 					CommandValid: true,
 					Command:      applyLog.Command,
 					CommandIndex: applyLog.Index,
+					CommandTerm:  applyLog.Term,
 				}
 				rf.applyCh <- msg
 			}
