@@ -163,7 +163,13 @@ func (rl *RaftLog) GetLogByIndex(index int) (*LogEntry, error) {
 		log.Fatalf("[ERROR] index != log.Index")
 		return nil, errIllegalState
 	}
-	return e, nil
+	// make copy
+	c := &LogEntry{
+		Term:    e.Term,
+		Index:   e.Index,
+		Command: e.Command,
+	}
+	return c, nil
 }
 
 func (rl *RaftLog) GetLogBetweenIndexes(start, end int) ([]*LogEntry, error) {
@@ -183,7 +189,18 @@ func (rl *RaftLog) GetLogBetweenIndexes(start, end int) ([]*LogEntry, error) {
 		return nil, errLogsNotExist
 	}
 	logs := rl.entries[start:end]
-	return logs, nil
+
+	cs := make([]*LogEntry, 0, len(logs))
+	for _, entry := range logs {
+		c := &LogEntry{
+			Term:    entry.Term,
+			Index:   entry.Index,
+			Command: entry.Command,
+		}
+		cs = append(cs, c)
+	}
+
+	return cs, nil
 }
 
 // AppendLog 追加一个日志，必须保证term比最新的log的term至少一样大
@@ -905,12 +922,12 @@ func (rf *Raft) execHeartbeat() {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendLogsToOtherServerfunc(i, rf.me)
+		go rf.sendLogsToOtherServer(i, rf.me)
 	}
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) sendLogsToOtherServerfunc(server int, me int) {
+func (rf *Raft) sendLogsToOtherServer(server int, me int) {
 	retry := true
 	for retry {
 		rf.mu.Lock()
