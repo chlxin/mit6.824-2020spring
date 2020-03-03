@@ -178,8 +178,8 @@ func (rl *RaftLog) GetLogBetweenIndexes(start, end int) ([]*LogEntry, error) {
 	}
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
-	if start < 0 {
-		return nil, errLogsNotExist
+	if start < 1 {
+		return nil, errIllegalIndex
 	}
 	start = rl.calculateIndex(start)
 	end = rl.calculateIndex(end)
@@ -190,6 +190,7 @@ func (rl *RaftLog) GetLogBetweenIndexes(start, end int) ([]*LogEntry, error) {
 	}
 	logs := rl.entries[start:end]
 
+	// copy 一份
 	cs := make([]*LogEntry, 0, len(logs))
 	for _, entry := range logs {
 		c := &LogEntry{
@@ -201,6 +202,27 @@ func (rl *RaftLog) GetLogBetweenIndexes(start, end int) ([]*LogEntry, error) {
 	}
 
 	return cs, nil
+}
+
+// prevLog 返回index前一个log，假如说传入为小于等于1，那么返回的为index:0,term:0的日志
+func (rl *RaftLog) prevLog(index int) *LogEntry {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if index <= 1 {
+		return emptyLogEntry
+	}
+
+	idx := rl.calculateIndex(index - 1)
+	e := rl.entries[idx]
+	// make copy
+	c := &LogEntry{
+		Term:    e.Term,
+		Index:   e.Index,
+		Command: e.Command,
+	}
+
+	return c
 }
 
 // AppendLog 追加一个日志，必须保证term比最新的log的term至少一样大
@@ -942,15 +964,15 @@ func (rf *Raft) sendLogsToOtherServer(server int, me int) {
 			err     error
 		)
 		immediatelyNewIndex := lastLog.Index + 1
-		entries, err = rf.logs.GetLogBetweenIndexes(nextIndex-1, immediatelyNewIndex)
+		entries, err = rf.logs.GetLogBetweenIndexes(nextIndex, immediatelyNewIndex)
 		if err != nil {
 			DEBUG("[ERROR] GetLogBetweenIndexes err:%v, nextIndex:%d, immediatelyNewIndex:%d",
 				err, nextIndex, immediatelyNewIndex)
 			rf.mu.Unlock()
 			return
 		}
-		fe := entries[0]
-		entries = entries[1:]
+
+		fe := rf.logs.prevLog(nextIndex)
 
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
