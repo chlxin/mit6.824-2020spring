@@ -176,12 +176,7 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.term)
-	e.Encode(rf.logs)
-
-	data := w.Bytes()
+	data := rf.encodeHardState()
 	rf.persister.SaveRaftState(data)
 }
 
@@ -588,10 +583,19 @@ func (rf *Raft) applier() {
 		time.Sleep(90 * time.Millisecond)
 		rf.mu.Lock()
 		var (
-			applyLogs []LogEntry
+			applyLogs    []LogEntry
+			commandValid bool
+			commitIndex  int
 		)
-		commitIndex := rf.commitIndex
-		if rf.lastApplied < commitIndex {
+
+		if rf.lastApplied < rf.lastIncludedIndex {
+			// should install snapshot
+			commandValid = false
+			commitIndex = rf.lastIncludedIndex
+			applyLogs = []LogEntry{{Index: rf.lastIncludedIndex, Term: rf.lastIncludedTerm, Command: "installSnapshot"}}
+		} else if rf.lastApplied < rf.commitIndex {
+			commandValid = true
+			commitIndex = rf.commitIndex
 			applyLogs = rf.getLogsRange(rf.lastApplied+1, commitIndex+1)
 
 			DPrintf("me:%d, term:%d apply message index[%d-%d]",
@@ -601,7 +605,7 @@ func (rf *Raft) applier() {
 		if len(applyLogs) > 0 {
 			for _, applyLog := range applyLogs {
 				msg := ApplyMsg{
-					CommandValid: true,
+					CommandValid: commandValid,
 					Command:      applyLog.Command,
 					CommandIndex: applyLog.Index,
 					// CommandTerm:  applyLog.Term,
@@ -851,14 +855,39 @@ func (rf *Raft) indexOf(index int) int {
 func (rf *Raft) clearSnapshot() {
 	rf.logs = []LogEntry{LogEntry{Index: 0, Term: 0, Command: nil}}
 
+	data := rf.encodeHardState()
+
+	rf.persister.SaveStateAndSnapshot(data, nil)
+}
+
+func (rf *Raft) Snapshot(lastCommandIndex int, snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := rf.indexOf(lastCommandIndex)
+	if index <= 0 {
+		log.Fatalf("Snapshot failed, lastCommandInex:%d illegal", lastCommandIndex)
+	}
+
+	rf.logs = rf.logs[index:]
+	rf.logs[0].Command = nil
+	rf.lastIncludedIndex = rf.logs[0].Index
+	rf.lastIncludedTerm = rf.logs[0].Term
+
+	data := rf.encodeHardState()
+
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+
+}
+
+func (rf *Raft) encodeHardState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
 	e.Encode(rf.logs)
 
 	data := w.Bytes()
-
-	rf.persister.SaveStateAndSnapshot(data, nil)
+	return data
 }
 
 // consistentCheck prevLogIndex和lastIncludedIndex，lastIndex有三种可能
