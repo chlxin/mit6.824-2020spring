@@ -1,13 +1,22 @@
 package kvraft
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"time"
+)
 
+const (
+	RetryInterval = time.Duration(125 * time.Millisecond)
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientID  int64
+	RequestID int
+	leaderID  int
 }
 
 func nrand() int64 {
@@ -21,6 +30,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leaderID = 0
+	ck.clientID = nrand()
+	ck.RequestID = 0
 	return ck
 }
 
@@ -39,7 +51,22 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:      key,
+		ClientID: ck.clientID,
+	}
+
+	for {
+		var reply GetReply
+		ok := ck.servers[ck.leaderID].Call("KVServer.Get", &args, &reply)
+		if ok && reply.Err == OK {
+			DPrintf("clientID:%d call server %d Get key %s reply %#v", ck.clientID, ck.leaderID, key, reply)
+			return reply.Value
+		}
+		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
+	}
+
 }
 
 //
@@ -54,6 +81,31 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	// You will have to modify this function.
+	ck.RequestID++
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClientID:  ck.clientID,
+		RequestID: ck.RequestID,
+	}
+	for {
+		var reply PutAppendReply
+		ok := ck.servers[ck.leaderID].Call("KVServer.PutAppend", &args, &reply)
+		if ok && reply.Err == OK {
+			if op == "Put" {
+				DPrintf("clientID:%d call server %d seq %d PUT key %s value %s reply %v",
+					ck.clientID, ck.leaderID, args.RequestID, args.Key, args.Value, reply)
+			} else {
+				DPrintf("clientID:%d call server %d seq %d APPEND key %s value %s reply %v",
+					ck.clientID, ck.leaderID, args.RequestID, args.Key, args.Value, reply)
+			}
+			return
+		}
+		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
+		time.Sleep(RetryInterval)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

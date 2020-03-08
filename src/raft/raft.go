@@ -105,6 +105,11 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
+}
+
+type RoleChange struct {
+	IsLeader bool
 }
 
 //
@@ -138,6 +143,7 @@ type Raft struct {
 	nextIndexes  []int
 	matchIndexes []int
 
+	roleChangeCh         chan RoleChange
 	lastHeartbeat        time.Time
 	lastReceiveHeartbeat time.Time
 	// logs related
@@ -445,6 +451,11 @@ func (rf *Raft) becomeFollower(leaderID int) {
 	rf.matchIndexes = nil
 	if lastRole == leader {
 		rf.companignCond.Signal()
+		if rf.roleChangeCh != nil {
+			go func() {
+				rf.roleChangeCh <- RoleChange{IsLeader: false}
+			}()
+		}
 	}
 }
 
@@ -469,6 +480,11 @@ func (rf *Raft) becomeLeader() {
 	}
 	rf.lastHeartbeat = time.Now().Add(-time.Duration(2*rf.heartbeatInterval) * time.Millisecond)
 	rf.heartbeatCond.Signal()
+	if rf.roleChangeCh != nil {
+		go func() {
+			rf.roleChangeCh <- RoleChange{IsLeader: true}
+		}()
+	}
 }
 
 func (rf *Raft) timeout() (res time.Duration) {
@@ -608,7 +624,7 @@ func (rf *Raft) applier() {
 					CommandValid: commandValid,
 					Command:      applyLog.Command,
 					CommandIndex: applyLog.Index,
-					// CommandTerm:  applyLog.Term,
+					CommandTerm:  applyLog.Term,
 				}
 				rf.applyCh <- msg
 			}
@@ -617,6 +633,14 @@ func (rf *Raft) applier() {
 			rf.mu.Unlock()
 		}
 	}
+}
+
+func (rf *Raft) RegisterRoleChangeNotify() chan RoleChange {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.roleChangeCh = make(chan RoleChange)
+	return rf.roleChangeCh
 }
 
 func (rf *Raft) syncLogs(server int) {
