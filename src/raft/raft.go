@@ -78,16 +78,16 @@ func (le LogEntry) String() string {
 // 假如Success为false，那么假如Snapshot为true，意味着传进来的prevIndex已经被快照了; 假如Snapshot为false，那么看Conflict
 // 假如conflict为true，那么返回冲突的index和term，假如为false，那么返回最新的日志的index和term
 type consistentCheckResult struct {
-	Success  bool
-	Conflict bool
-	Snapshot bool
-	Index    int
-	Term     int
+	Success   bool
+	Conflict  bool
+	Snapshot  bool
+	HintIndex int
+	HintTerm  int
 }
 
 func (c consistentCheckResult) String() string {
 	return fmt.Sprintf("Success:%v, Conflict:%v, ConflictIndex:%d, ConflictTerm:%d",
-		c.Success, c.Conflict, c.Index, c.Term)
+		c.Success, c.Conflict, c.HintIndex, c.HintTerm)
 }
 
 //
@@ -192,6 +192,8 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		rf.term = 0
+		rf.lastIncludedIndex = 0
+		rf.lastIncludedTerm = 0
 		rf.logs = []LogEntry{LogEntry{Index: 0, Term: 0, Command: nil}}
 		return
 	}
@@ -212,15 +214,21 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var (
-		term int
-		logs []LogEntry
+		term              int
+		lastIncludedIndex int
+		lastIncludedTerm  int
+		logs              []LogEntry
 	)
 
 	if d.Decode(&term) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logs) != nil {
-		log.Fatalf("readPersist failed, decode error")
+		rf.fatalf("readPersist failed, decode error")
 	} else {
 		rf.term = term
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.logs = logs
 	}
 }
@@ -271,6 +279,18 @@ type AppendEntriesReply struct {
 	HintTerm  int
 }
 
+type InstallSnapshotArgs struct {
+	LeaderID          int
+	Term              int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -311,7 +331,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// DPrint("me:%d, term:%d role:%d receive AppendEntries, args:%s", rf.me, rf.currentTerm, rf.role, args.String())
+	// DPrintf("me:%d, term:%d role:%s receive AppendEntries, args:%s", rf.me, rf.term, rf.role, args.String())
 	if rf.term > args.Term {
 		reply.Term = rf.term
 		reply.Success = false
@@ -335,8 +355,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Snapshot = checkRes.Snapshot
 		reply.Conflict = checkRes.Conflict
-		reply.HintIndex = checkRes.Index
-		reply.HintTerm = checkRes.Term
+		reply.HintIndex = checkRes.HintIndex
+		reply.HintTerm = checkRes.HintTerm
 		return
 	}
 
@@ -356,11 +376,31 @@ Append:
 		}
 
 		if rf.commitIndex > commit {
-			log.Fatalf("commitIndex back")
+			rf.fatalf("commitIndex back")
 		}
 		rf.commitIndex = commit
 		DPrintf("me:%d, term:%d passivity commit message commitID:%d. now commitIndex:%d", rf.me, rf.term, commit, rf.commitIndex)
 	}
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.term > args.Term {
+		reply.Term = rf.term
+		return
+	}
+
+	rf.term = args.Term
+	reply.Term = rf.term
+	rf.becomeFollower(args.LeaderID)
+	rf.lastReceiveHeartbeat = time.Now()
+
+	rf.snapshotFromLeader(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+
+	DPrintf("me:%d, term:%d install snapshot success, args:[lastIncludedIndex:%d, lastIncludedTerm:%d]",
+		rf.me, rf.term, args.LastIncludedIndex, args.LastIncludedTerm)
 }
 
 //
@@ -399,6 +439,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -653,9 +698,40 @@ func (rf *Raft) syncLogs(server int) {
 		}
 
 		nextIndex := rf.nextIndexes[server]
-
+		lastIncludedIndex := rf.lastIncludedIndex
 		if nextIndex <= rf.lastIncludedIndex {
 			// TODO: should send snapshot
+			args := &InstallSnapshotArgs{
+				Term:              rf.term,
+				LeaderID:          rf.me,
+				LastIncludedIndex: lastIncludedIndex,
+				LastIncludedTerm:  rf.lastIncludedTerm,
+				Data:              rf.persister.ReadSnapshot(),
+			}
+
+			rf.mu.Unlock()
+			var reply InstallSnapshotReply
+			ok := rf.sendInstallSnapshot(server, args, &reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			if reply.Term > rf.term {
+				rf.term = reply.Term
+				rf.becomeFollower(unknownLeader)
+				rf.mu.Unlock()
+				return
+			}
+			if rf.role != leader {
+				// 可能已经变成follower，也可能是之前已经成为了leader
+				DPrintf("me:%d term:%d rf role is no longer roleLeader", rf.me, rf.term)
+				rf.mu.Unlock()
+				return
+			}
+
+			rf.nextIndexes[server] = lastIncludedIndex + 1
+			rf.mu.Unlock()
 		} else {
 			// append entries
 			lastLog := rf.lastLog()
@@ -725,7 +801,7 @@ func (rf *Raft) handleAppendEntriesReply(server int, lastLog LogEntry, reply *Ap
 				} else {
 					DPrintf("me:%d, term:%d commit message commitID:%d", rf.me, rf.term, c)
 					if rf.commitIndex > c {
-						log.Fatalf("commitIndex back")
+						rf.fatalf("commitIndex back")
 					}
 					rf.commitIndex = c
 				}
@@ -831,14 +907,14 @@ func (rf *Raft) AppendLogs(prevLogIndex int, prevLogTerm int, entries []LogEntry
 
 	checkRes := rf.consistentCheck(prevLogIndex, prevLogTerm)
 	if !checkRes.Success {
-		log.Fatalf("consistentCheck not pass")
+		rf.fatalf("consistentCheck not pass")
 	}
 
 	// DEBUG("me:%d AppendLogs prevLogIndex:%d, prevLogTerm:%d, local:%s, incomings:%s",
 	// rl.onwer, prevLogIndex, prevLogTerm, ENTRIES_STRING(rl.entries), ENTRIES_STRING(entries))
 
 	// 到这里说明prevLogIndex在entries能找到，并且term也一致，因此直接删除之后的日志
-	rf.logs = rf.logs[:prevLogIndex+1]
+	rf.logs = rf.logs[:rf.indexOf(prevLogIndex)+1]
 	rf.logs = append(rf.logs, entries...)
 
 	rf.persist()
@@ -849,7 +925,7 @@ func (rf *Raft) getLogsRange(start, end int) []LogEntry {
 	s := rf.indexOf(start)
 	e := rf.indexOf(end)
 	if s > e || s <= 0 || e > len(rf.logs) {
-		log.Fatalf("getLogsRange illegal argument: [%d, %d]", start, end)
+		rf.fatalf("getLogsRange illegal argument: [%d, %d]", start, end)
 	}
 
 	return rf.logs[s:e]
@@ -857,7 +933,7 @@ func (rf *Raft) getLogsRange(start, end int) []LogEntry {
 
 func (rf *Raft) prevLog(index int) LogEntry {
 	if index <= rf.lastIncludedIndex {
-		log.Fatalf("prevLog illegal index")
+		rf.fatalf("prevLog illegal index")
 	}
 
 	idx := rf.indexOf(index - 1)
@@ -871,43 +947,88 @@ func (rf *Raft) lastLog() LogEntry {
 // indexOf 入参必须大于等于lastIncludedIndex
 func (rf *Raft) indexOf(index int) int {
 	if index < rf.lastIncludedIndex {
-		log.Fatalf("illegal index:%d", index)
+		rf.fatalf("illegal index:%d", index)
 	}
 	return index - rf.lastIncludedIndex
 }
 
+// snapshotFromLeader 必须在持有锁的情况下调用,从leader的installSnapshot rpc中过来调用，生成快照，一切以leader为准
+func (rf *Raft) snapshotFromLeader(lastIncludedIndex int, lastIncludedTerm int, snapshot []byte) {
+	// 直接删除整个logs
+	DPrintf("me:%d, term:%d snapshotFromLeader, lastIncludedIndex:%d, lastIncludedTerm:%d", rf.me, rf.term, lastIncludedIndex, rf.lastIncludedTerm)
+	DPrintf("snapshotFromLeader before, rf:%s; lastCommandIndex:%d", rf.String(), lastIncludedTerm)
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+
+	ll := rf.lastLog()
+	var reserverd []LogEntry
+	if ll.Index > lastIncludedIndex {
+		reserverd = rf.logs[rf.indexOf(lastIncludedIndex)+1:]
+	}
+
+	rf.logs = make([]LogEntry, 0)
+	rf.logs = append(rf.logs, LogEntry{Index: lastIncludedIndex, Term: lastIncludedTerm})
+	if len(reserverd) > 0 {
+		rf.logs = append(rf.logs, reserverd...)
+	}
+	DPrintf("snapshotFromLeader after, rf:%s; lastCommandIndex:%d", rf.String(), lastIncludedTerm)
+	data := rf.encodeHardState()
+
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+}
+
 func (rf *Raft) clearSnapshot() {
 	rf.logs = []LogEntry{LogEntry{Index: 0, Term: 0, Command: nil}}
-
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 	data := rf.encodeHardState()
 
 	rf.persister.SaveStateAndSnapshot(data, nil)
 }
 
+// Snapshot 给外部调用，不需要持有锁
 func (rf *Raft) Snapshot(lastCommandIndex int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	index := rf.indexOf(lastCommandIndex)
 	if index <= 0 {
-		log.Fatalf("Snapshot failed, lastCommandInex:%d illegal", lastCommandIndex)
+		rf.fatalf("Snapshot failed, lastCommandInex:%d illegal", lastCommandIndex)
 	}
-
+	DPrintf("Snapshot before, rf:%s; lastCommandIndex:%d", rf.String(), lastCommandIndex)
 	rf.logs = rf.logs[index:]
 	rf.logs[0].Command = nil
 	rf.lastIncludedIndex = rf.logs[0].Index
 	rf.lastIncludedTerm = rf.logs[0].Term
-
+	DPrintf("Snapshot after, rf:%s; lastCommandIndex:%d", rf.String(), lastCommandIndex)
 	data := rf.encodeHardState()
 
 	rf.persister.SaveStateAndSnapshot(data, snapshot)
 
 }
 
+// RaftStateSize 给外部获取当前raft log的大小，决定时候需要snapshot
+func (rf *Raft) RaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.persister.RaftStateSize()
+}
+
+// ReadSnapshot 给外部读取快照
+func (rf *Raft) ReadSnapshot() []byte {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.persister.ReadSnapshot()
+}
+
 func (rf *Raft) encodeHardState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.logs)
 
 	data := w.Bytes()
@@ -924,8 +1045,8 @@ func (rf *Raft) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCh
 		(prevLogIndex == rf.lastIncludedIndex && prevLogTerm != rf.lastIncludedTerm) {
 		res.Success = false
 		res.Snapshot = true
-		res.Index = prevLogIndex
-		res.Term = prevLogTerm
+		res.HintIndex = prevLogIndex
+		res.HintTerm = prevLogTerm
 		return res
 	}
 
@@ -937,8 +1058,8 @@ func (rf *Raft) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCh
 		res.Snapshot = false
 		res.Conflict = false
 		lastLog := rf.logs[len(rf.logs)-1]
-		res.Index = lastLog.Index
-		res.Term = lastLog.Term
+		res.HintIndex = lastLog.Index
+		res.HintTerm = lastLog.Term
 		return res
 	}
 
@@ -953,15 +1074,17 @@ func (rf *Raft) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCh
 	res.Conflict = true
 	// e.Index一定>=rf.lastIncludedIndex + 1,假如是rf.lastIncludedIndex上面就返回success了
 	// 因此下面代码至少会走一次，如果是1，那么一定会设置res(因为index为0，term为0，其他的log的term一定大于0)。也就是说下面的if至少会走一次
+	res.HintIndex = rf.logs[1].Index // 这里1的日志必定存在
+	res.HintTerm = rf.logs[1].Term
 	for i := rf.indexOf(e.Index); i >= 1; i-- {
 		if rf.logs[i-1].Term != e.Term {
-			res.Index = rf.logs[i].Index
-			res.Term = rf.logs[i].Term
+			res.HintIndex = rf.logs[i].Index
+			res.HintTerm = rf.logs[i].Term
 		}
 	}
 	// 确保到这里ConflictIndex肯定大于rf.LastIncludedIndex
-	if res.Index <= rf.lastIncludedIndex {
-		log.Fatalf("illegal state")
+	if res.HintIndex <= rf.lastIncludedIndex {
+		rf.fatalf("illegal state, prevLogIndex:%d, prevLogTerm:%d", prevLogIndex, prevLogTerm)
 	}
 	return res
 }
@@ -984,6 +1107,18 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) fatalf(format string, a ...interface{}) {
+	log.Println(stack())
+	log.Println(rf.String())
+	log.Fatalf(format, a...)
+}
+
+func (rf *Raft) String() string {
+	bs, _ := json.Marshal(rf.logs)
+	return fmt.Sprintf("[me:%d, term:%d, role:%s, vote:%d, commitIndex:%d, lastApplied:%d, lastIncludedIndex:%d, lastIncludedTerm:%d, logs:%s]",
+		rf.me, rf.term, rf.role, rf.voteFor, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, rf.lastIncludedTerm, string(bs))
 }
 
 //

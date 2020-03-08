@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -65,13 +66,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Key:     args.Key,
 		ClintID: args.ClientID,
 	}
-	resCh := make(chan startResult, 1)
-	go kv.start(op, resCh)
+	err, value := kv.start(op)
 
-	res := <-resCh
-
-	reply.Err = res.Err
-	reply.Value = res.Value
+	reply.Err = err
+	reply.Value = value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -84,25 +82,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClintID:   args.ClientID,
 		RequestID: args.RequestID,
 	}
-	resCh := make(chan startResult, 1)
-	go kv.start(op, resCh)
+	err, _ := kv.start(op)
 
-	res := <-resCh
-
-	reply.Err = res.Err
+	reply.Err = err
 
 }
 
 // start 该方法的期望是使用一个独立的协程来处理，结果用notifyCh来传输，但是内部会加锁 TODO: 是不是没必要用channel接结果
-func (kv *KVServer) start(op Op, resCh chan startResult) {
+func (kv *KVServer) start(op Op) (err Err, value string) {
 
-	res := startResult{Err: OK, Value: ""}
-	defer func() {
-		resCh <- res
-	}()
+	err, value = OK, ""
+
 	index, term, ok := kv.rf.Start(op)
 	if !ok {
-		res.Err = ErrWrongLeader
+		err = ErrWrongLeader
 		return
 	}
 
@@ -115,11 +108,13 @@ func (kv *KVServer) start(op Op, resCh chan startResult) {
 
 	case result := <-notifyCh:
 		if result.Term != term {
-			res.Err, res.Value = ErrWrongLeader, ""
+			err, value = ErrWrongLeader, ""
 		} else {
-			res.Err, res.Value = result.Err, result.Value
+			err, value = result.Err, result.Value
 		}
 	}
+
+	return
 
 }
 
@@ -141,8 +136,7 @@ func (kv *KVServer) service() {
 					Key:     "",
 					ClintID: 0,
 				}
-				notifyCh := make(chan startResult, 1)
-				go kv.start(op, notifyCh)
+				go kv.start(op)
 			} else {
 				for index, ch := range kv.notifyChanMap {
 					reply := notification{
@@ -164,8 +158,10 @@ func (kv *KVServer) service() {
 				if cmd, ok := msg.Command.(string); ok {
 					if cmd == "installSnapshot" {
 						DPrintf("server:%d snapshot", kv.me)
+						kv.mu.Lock()
+						kv.readSnapshot()
+						kv.mu.Unlock()
 					}
-
 				}
 			}
 
@@ -197,6 +193,7 @@ func (kv *KVServer) applyMsg(msg raft.ApplyMsg) {
 	}
 
 	kv.notifyIfPresent(msg.CommandIndex, result)
+	kv.snapshotIfNeeded(msg.CommandIndex)
 	kv.mu.Unlock()
 }
 
@@ -205,6 +202,48 @@ func (kv *KVServer) notifyIfPresent(index int, reply notification) {
 	if ch, ok := kv.notifyChanMap[index]; ok {
 		delete(kv.notifyChanMap, index)
 		ch <- reply
+	}
+}
+
+func (kv *KVServer) snapshotIfNeeded(index int) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	size := kv.rf.RaftStateSize()
+	thredshold := int(1.5 * float64(kv.maxraftstate))
+	if size >= thredshold {
+		snapshot := kv.encodeHardState()
+		kv.rf.Snapshot(index, snapshot)
+	}
+}
+
+func (kv *KVServer) encodeHardState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvs)
+	e.Encode(kv.clients)
+
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) readSnapshot() {
+	snapshot := kv.rf.ReadSnapshot()
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var (
+		kvs     map[string]string
+		clients map[int64]int
+	)
+
+	if d.Decode(&kvs) != nil ||
+		d.Decode(&clients) != nil {
+		log.Fatalf("readSnapshot failed, decode error")
+	} else {
+		kv.kvs = kvs
+		kv.clients = clients
 	}
 }
 
@@ -223,11 +262,27 @@ func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	close(kv.shutdown)
+	// 需要cleanup，清除一下notifyChanMap
+	kv.mu.Lock()
+	kv.cleanup()
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) cleanup() {
+	for index, ch := range kv.notifyChanMap {
+		reply := notification{
+			Term:  0,
+			Value: "",
+			Err:   ErrWrongLeader,
+		}
+		delete(kv.notifyChanMap, index)
+		ch <- reply
+	}
 }
 
 //

@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	RetryInterval = time.Duration(125 * time.Millisecond)
+	retryInterval = time.Duration(125 * time.Millisecond)
 )
 
 type Clerk struct {
@@ -35,6 +35,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.RequestID = 0
 	return ck
 }
+
+// func (ck *Clerk) callWithTimeout(server int, method string, args interface{}, reply interface{}) bool {
+// 	return false
+// }
 
 //
 // fetch the current value for a key.
@@ -64,7 +68,7 @@ func (ck *Clerk) Get(key string) string {
 			return reply.Value
 		}
 		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
-		time.Sleep(RetryInterval)
+		time.Sleep(retryInterval)
 	}
 
 }
@@ -104,7 +108,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			return
 		}
 		ck.leaderID = (ck.leaderID + 1) % len(ck.servers)
-		time.Sleep(RetryInterval)
+		time.Sleep(retryInterval)
 	}
 }
 

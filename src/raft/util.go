@@ -1,6 +1,9 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"runtime"
+)
 
 func init() {
 	log.SetFlags(log.Lmicroseconds)
@@ -14,4 +17,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+func stack() string {
+	var buf [2 << 10]byte
+	return string(buf[:runtime.Stack(buf[:], true)])
 }
