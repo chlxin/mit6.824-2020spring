@@ -217,16 +217,19 @@ func (rf *Raft) readPersist(data []byte) {
 		term              int
 		lastIncludedIndex int
 		lastIncludedTerm  int
+		voteFor           int
 		logs              []LogEntry
 	)
 
 	if d.Decode(&term) != nil ||
+		d.Decode(&voteFor) != nil ||
 		d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logs) != nil {
 		rf.fatalf("readPersist failed, decode error")
 	} else {
 		rf.term = term
+		rf.voteFor = voteFor
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.logs = logs
@@ -1027,6 +1030,7 @@ func (rf *Raft) encodeHardState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
+	e.Encode(rf.voteFor)
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.logs)
@@ -1155,7 +1159,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.lastReceiveHeartbeat = time.Now()
-	rf.becomeFollower(unknownLeader)
+	// rf.becomeFollower(unknownLeader)
+	rf.role = follower
 	rf.mu.Unlock()
 
 	go rf.compaignPoll()
