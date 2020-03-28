@@ -4,14 +4,18 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"time"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	RequestID int
+	clientID  int64
 }
 
 func nrand() int64 {
@@ -25,6 +29,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientID = nrand()
+	ck.RequestID = 0
 	return ck
 }
 
@@ -32,12 +38,14 @@ func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.ClientID = ck.clientID
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
+				DPrintf("client:%d, get config:[%v]", ck.clientID, reply.Config)
 				return reply.Config
 			}
 		}
@@ -46,10 +54,12 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
+	ck.RequestID++
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
-
+	args.ClientID = ck.clientID
+	args.RequestID = ck.RequestID
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -64,10 +74,12 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
+	ck.RequestID++
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
-
+	args.ClientID = ck.clientID
+	args.RequestID = ck.RequestID
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -82,11 +94,13 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
+	ck.RequestID++
 	args := &MoveArgs{}
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-
+	args.ClientID = ck.clientID
+	args.RequestID = ck.RequestID
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {

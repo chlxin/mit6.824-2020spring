@@ -192,6 +192,7 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		rf.term = 0
+		rf.voteFor = unknownLeader
 		rf.lastIncludedIndex = 0
 		rf.lastIncludedTerm = 0
 		rf.logs = []LogEntry{LogEntry{Index: 0, Term: 0, Command: nil}}
@@ -475,11 +476,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.role == leader
 	term = rf.term
 	if isLeader {
-
+		// log.Printf("testtest command:%v\n", command)
 		index = rf.AppendLog(term, command)
 		// rf.persist()
 		rf.matchIndexes[rf.me] = index // 自己的match值永远最新
-		DPrintf("me:%d term:%d start success index:%d", rf.me, rf.term, index)
+		DPrintf("me:%d term:%d start success index:%d, Command:%v", rf.me, rf.term, index, command)
 	} else {
 		ll := rf.lastLog()
 		index = ll.Index + 1
@@ -664,6 +665,7 @@ func (rf *Raft) applier() {
 
 			DPrintf("me:%d, term:%d apply message index[%d-%d]",
 				rf.me, rf.term, applyLogs[0].Index, applyLogs[len(applyLogs)-1].Index)
+			// DPrintf("raft:%s", rf.String())
 		}
 		rf.mu.Unlock()
 		if len(applyLogs) > 0 {
@@ -674,6 +676,7 @@ func (rf *Raft) applier() {
 					CommandIndex: applyLog.Index,
 					CommandTerm:  applyLog.Term,
 				}
+				// log.Printf("applyMsg:%v\n", msg)
 				rf.applyCh <- msg
 			}
 			rf.mu.Lock()

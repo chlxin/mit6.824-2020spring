@@ -88,7 +88,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 }
 
-// start 该方法的期望是使用一个独立的协程来处理，结果用notifyCh来传输，但是内部会加锁 TODO: 是不是没必要用channel接结果
+// start 该方法的期望是使用一个独立的协程来处理，结果用notifyCh来传输，但是内部会加锁, 是不是没必要用channel接结果
 func (kv *KVServer) start(op Op) (err Err, value string) {
 
 	err, value = OK, ""
@@ -188,7 +188,7 @@ func (kv *KVServer) applyMsg(msg raft.ApplyMsg) {
 			} else if cmd == "Append" {
 				kv.kvs[op.Key] += op.Value
 			}
-			kv.clients[op.ClintID] = op.RequestID // TODO: 这个修改必须持有锁的情况，也就是applyMsg必须在持有锁的时候调用
+			kv.clients[op.ClintID] = op.RequestID
 		}
 	}
 
@@ -312,8 +312,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	kv.shutdown = make(chan struct{})
 
 	// You may need initialization code here.
 	kv.shutdown = make(chan struct{})
