@@ -6,6 +6,7 @@ import (
 	"labrpc"
 	"log"
 	"raft"
+	"sort"
 	"sync"
 )
 
@@ -69,8 +70,8 @@ func (sm *ShardMaster) String() string {
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
-	DPrintf("server:%d Join args:[servers:%v, Client:%d, requestID:%d]",
-		sm.me, args.Servers, args.ClientID, args.RequestID)
+	// DPrintf("server:%d Join args:[servers:%v, Client:%d, requestID:%d]",
+	// 	sm.me, args.Servers, args.ClientID, args.RequestID)
 	op := Op{
 		Op:        OpJoin,
 		Servers:   args.Servers,
@@ -84,8 +85,8 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
-	DPrintf("server:%d Leave args:[GIDS:%v, Client:%d, requestID:%d]",
-		sm.me, args.GIDs, args.ClientID, args.RequestID)
+	// DPrintf("server:%d Leave args:[GIDS:%v, Client:%d, requestID:%d]",
+	// 	sm.me, args.GIDs, args.ClientID, args.RequestID)
 	op := Op{
 		Op:        OpLeave,
 		GIDs:      args.GIDs,
@@ -99,8 +100,8 @@ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
-	DPrintf("server:%d Move args:[Shard:%d, GID:%d, Client:%d, requestID:%d]",
-		sm.me, args.Shard, args.GID, args.ClientID, args.RequestID)
+	// DPrintf("server:%d Move args:[Shard:%d, GID:%d, Client:%d, requestID:%d]",
+	// sm.me, args.Shard, args.GID, args.ClientID, args.RequestID)
 	op := Op{
 		Op:        OpMove,
 		Shard:     args.Shard,
@@ -115,7 +116,7 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-	DPrintf("server:%d Query args:[Num:%d, Client:%d]", sm.me, args.Num, args.ClientID)
+	// DPrintf("server:%d Query args:[Num:%d, Client:%d]", sm.me, args.Num, args.ClientID)
 	op := Op{
 		Op:      OpQuery,
 		Num:     args.Num,
@@ -368,6 +369,7 @@ func assignShards(groups map[int][]string) [NShards]int {
 	}
 	lenOfGs := len(gs)
 
+	sort.Ints(gs)
 	// 简单起见，使用取模的算法。
 	// 假如有3个group, 那么shardsId % 3来分配groupsId
 	shards := [NShards]int{}
