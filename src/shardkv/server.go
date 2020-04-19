@@ -169,7 +169,7 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 func (kv *ShardKV) sendTransfer(done chan struct{}, configNum int, gid int,
 	servers []string, data map[int]TransferShard) {
 	defer func() {
-		done <- struct{}{}
+		close(done)
 	}()
 
 	args := TransferArgs{
@@ -596,6 +596,7 @@ func (kv *ShardKV) periodicFetch() {
 
 			kv.mu.Lock()
 			c := kv.mck.Query(kv.currentConfig.Num + 1)
+			//DPrintf("server:%d, gid:%d try to fetch config, config:[%+v]", kv.me, kv.gid, c)
 			kv.lastReceiveConfigTime = time.Now()
 			if !kv.isLeader {
 				kv.mu.Unlock()
@@ -603,6 +604,9 @@ func (kv *ShardKV) periodicFetch() {
 			}
 
 			if kv.transferring {
+				bs, _ := json.Marshal(kv.shardKvs)
+				DPrintf("server:%d, gid:%d try to fetch config, but transferring=[%v], shards:[%s], kv.finishSending:%v",
+					kv.me, kv.gid, kv.transferring, string(bs), kv.finishSending)
 				kv.mu.Unlock()
 				break
 			}
@@ -652,6 +656,9 @@ func (kv *ShardKV) transferTask() {
 
 			//var wg sync.WaitGroup
 			doneCh := make([]chan struct{}, len(shardMap))
+			for i := 0; i < len(doneCh); i++ {
+				doneCh[i] = make(chan struct{}, 1)
+			}
 
 			i := 0
 			for gid, shards := range shardMap {
@@ -690,7 +697,7 @@ func (kv *ShardKV) transferTask() {
 			}
 
 			op := Op{
-				Op:        "",
+				Op:        "finishSendingData",
 				ConfigNum: kv.currentConfig.Num,
 				Shards:    nil,
 			}
@@ -730,6 +737,7 @@ func (kv *ShardKV) checkConfigChangeFinished() {
 		DPrintf("server:%d, gid:%d checkConfigChangeFinished done, configNum:%d",
 			kv.me, kv.gid, kv.currentConfig.Num)
 		kv.transferring = false
+		kv.finishSending = false
 	}
 }
 
@@ -830,7 +838,10 @@ func (kv *ShardKV) Kill() {
 	// Your code here, if desired.
 	close(kv.shutdown)
 	// 需要cleanup，清除一下notifyChanMap
+	DPrintf("server:%d, gid:%d, begin cleanup", kv.me, kv.gid)
 	kv.mu.Lock()
+	DPrintf("server:%d, gid:%d, cleanup", kv.me, kv.gid)
+
 	kv.cleanup()
 	kv.mu.Unlock()
 }
