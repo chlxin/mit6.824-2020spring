@@ -14,8 +14,6 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
-	// 自定义的
-	ErrOutdatedConfig = "ErrOutdatedConfig"
 )
 
 type Err string
@@ -52,6 +50,7 @@ type GetReply struct {
 
 type TransferArgs struct {
 	ConfigNum int
+	GID       int
 	Shards    map[int]TransferShard
 }
 
@@ -62,5 +61,6 @@ type TransferReply struct {
 type TransferShard struct {
 	ID        int
 	ConfigNum int
+	Dirty     bool
 	Data      map[string]string
 }
