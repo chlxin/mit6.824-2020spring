@@ -4,3 +4,4 @@ api.key
 bin/*
 *.so
 *.log
+.idea/

@@ -338,7 +338,7 @@ func (sm *ShardMaster) move(shard int, gID int) Config {
 }
 
 func (sm *ShardMaster) query(num int) Config {
-	if num < 0 || num > len(sm.configs) {
+	if num < 0 || num >= len(sm.configs) {
 		return sm.configs[len(sm.configs)-1]
 	}
 

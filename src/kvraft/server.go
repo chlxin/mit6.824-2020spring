@@ -74,7 +74,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("server:%d PutAppend args:[Key:%s, value:%s, Client:%d, requestID:%d]", kv.me, args.Key, args.Value, args.ClientID, args.RequestID)
+	DPrintf("server:%d PutAppend args:[Key:%s, value:%s, Client:%d, requestID:%d]",
+		kv.me, args.Key, args.Value, args.ClientID, args.RequestID)
 	op := Op{
 		Op:        args.Op,
 		Key:       args.Key,

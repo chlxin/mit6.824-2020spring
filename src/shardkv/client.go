@@ -42,6 +42,8 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientID  int64
+	requestID int
 }
 
 //
@@ -58,6 +60,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.clientID = nrand()
+	ck.requestID = 0
+
 	return ck
 }
 
@@ -70,8 +75,10 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.ClientID = ck.clientID
 
 	for {
+		args.ConfigNum = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -91,7 +98,7 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask master for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sm.Query(ck.config.Num + 1)
 	}
 
 	return ""
@@ -106,8 +113,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.ClientID = ck.clientID
+	ck.requestID++
+	args.RequestID = ck.requestID
 
 	for {
+		args.ConfigNum = ck.config.Num
+
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -119,6 +131,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.requestID++
+					args.RequestID = ck.requestID
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -126,7 +140,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask master for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.config = ck.sm.Query(ck.config.Num + 1)
 	}
 }
 
