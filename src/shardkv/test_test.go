@@ -835,7 +835,7 @@ func TestChallenge2Unaffected(t *testing.T) {
 		owned[s] = gid == cfg.groups[1].gid
 	}
 
-	// Wait for migration to new config to complete, and for clients to
+	// Wait for migration to new config to complete, and for Clients to
 	// start using this updated config. Gets to any key k such that
 	// owned[shard(k)] == true should now be served by group 101.
 	<-time.After(1 * time.Second)
@@ -853,7 +853,7 @@ func TestChallenge2Unaffected(t *testing.T) {
 	// 101 doesn't get a chance to migrate things previously owned by 100
 	cfg.leave(0)
 
-	// Wait to make sure clients see new config
+	// Wait to make sure Clients see new config
 	<-time.After(1 * time.Second)
 
 	// And finally: check that gets/puts for 101-owned keys still complete

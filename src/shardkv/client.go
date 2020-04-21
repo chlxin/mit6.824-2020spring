@@ -131,8 +131,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
-					ck.requestID++
-					args.RequestID = ck.requestID
+					//ck.requestID++
+					//args.RequestID = ck.requestID
 					break
 				}
 				// ... not ok, or ErrWrongLeader

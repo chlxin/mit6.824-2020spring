@@ -63,4 +63,5 @@ type TransferShard struct {
 	ConfigNum int
 	Dirty     bool
 	Data      map[string]string
+	Clients   map[int64]int
 }

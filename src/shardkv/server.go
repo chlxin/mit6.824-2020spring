@@ -53,22 +53,14 @@ type notification struct {
 	Err   Err
 }
 
-//
-//type ShardState string
-//
-//const (
-//	shardStateNotResponsible = "notResponsible"
-//	shardStatePending        = "pending"
-//	shardStateAvailable      = "available"
-//)
-
 type ShardData struct {
 	ID          int
 	Responsible bool // 当前group是否需要为该分片提供服务
 	Own         bool // 当前group是否拥有该分片最新的数据
 	Dirty       bool // 当前是否已经被transfer过了
 	Data        map[string]string
-	ConfigNum   int // 上一次写入的ConfigNum
+	Clients     map[int64]int // key:clientId, value:已经处理过的最新的requestId
+	ConfigNum   int           // 上一次写入的ConfigNum
 }
 
 type transferTask struct {
@@ -82,6 +74,7 @@ type transferTaskShard struct {
 	ShardID   int
 	Dirty     bool
 	Data      map[string]string
+	Clients   map[int64]int
 	ConfigNum int
 }
 
@@ -107,7 +100,6 @@ type ShardKV struct {
 	currentConfig shardmaster.Config
 	taskQueue     map[int]transferTask
 	shardKvs      [shardmaster.NShards]*ShardData
-	clients       map[int64]int             // key:clientId, value:已经处理过的最新的requestId
 	notifyChanMap map[int]chan notification // 需要用mu来保护并发访问, key为index，一旦notify后就需要删除
 }
 
@@ -236,7 +228,9 @@ func (kv *ShardKV) start(op Op) (err Err, value string) {
 	}
 
 	// 要先判断幂等性，不然返回ErrWrongGroup后request会自增，就会重复执行
-	if (op.Op == "Put" || op.Op == "Append") && kv.clients[op.ClintID] >= op.RequestID {
+	i := key2shard(op.Key)
+	shard := kv.shardKvs[i]
+	if (op.Op == "Put" || op.Op == "Append") && shard.Clients[op.ClintID] >= op.RequestID {
 		err = OK
 		kv.mu.Unlock()
 		return
@@ -367,10 +361,9 @@ func (kv *ShardKV) putAppend(op Op, cmd string) (value string, err Err) {
 				kv.me, kv.gid, op.ConfigNum, config.Num)
 		}
 		// 重复请求不处理
-		if kv.clients[op.ClintID] < op.RequestID {
-			i := key2shard(op.Key)
-			shard := kv.shardKvs[i]
-
+		i := key2shard(op.Key)
+		shard := kv.shardKvs[i]
+		if shard.Clients[op.ClintID] < op.RequestID {
 			if !shard.Responsible {
 				DPrintf("gid:%d putAppend key:%s [NotResponsible], config:%v", kv.gid, op.Key, kv.currentConfig)
 				err = ErrWrongGroup
@@ -387,7 +380,7 @@ func (kv *ShardKV) putAppend(op Op, cmd string) (value string, err Err) {
 			} else if cmd == "Append" {
 				shard.Data[op.Key] += op.Value
 			}
-			kv.clients[op.ClintID] = op.RequestID
+			shard.Clients[op.ClintID] = op.RequestID
 			shard.ConfigNum = config.Num
 
 		}
@@ -449,15 +442,6 @@ func (kv *ShardKV) configChange(op Op) (value string, err Err) {
 			shard.Responsible = true
 
 			if shard.Own {
-				//everOwnByOthers := false // 在这中间是否属于别的group过
-				//for j := previous.Num + 1; j < current.Num; j++ {
-				//	if kv.configs[j].Shards[i] != kv.gid {
-				//		everOwnByOthers = true
-				//	}
-				//}
-				//if everOwnByOthers {
-				//	shard.Own = false // 需要等待其他group发过来最新的
-				//}
 				if shard.Dirty {
 					shard.Own = false
 				}
@@ -493,6 +477,7 @@ func (kv *ShardKV) configChange(op Op) (value string, err Err) {
 				ShardID:   shard.ID,
 				Dirty:     shard.Dirty,
 				Data:      data,
+				Clients:   copyIntMap(shard.Clients),
 				ConfigNum: shard.ConfigNum,
 			}
 			allData = append(allData, tts)
@@ -519,50 +504,6 @@ func (kv *ShardKV) configChange(op Op) (value string, err Err) {
 
 	kv.taskQueue[taskID] = task
 
-	//if kv.isLeader {
-	//DPrintf("server:%d, gid:%d transfer data to gid:%d", kv.me, kv.gid, gid)
-	//go kv.sendTransfer(doneCh[i], config.Num, gid, config.Groups[gid], allData)
-	//}
-
-	//if length > 0 {
-	//	bs, _ := json.Marshal(shardMap)
-	//	DPrintf("server:%d, gid:%d transfer data, shardMap:[%s]", kv.me, kv.gid, string(bs))
-	//	//DPrintf("server:%d, gid:%d finish transfer data one round", kv.me, kv.gid)
-	//}
-
-	//if kv.isLeader {
-	//	go func(num int) {
-	//		for i := 0; i < length; i++ {
-	//			select {
-	//			case <-kv.shutdown:
-	//				return
-	//			case <-doneCh[i]:
-	//			}
-	//
-	//		}
-	//		kv.mu.Lock()
-	//
-	//		shards := make(map[int]TransferShard)
-	//		for _, shard := range shardMap {
-	//			for _, data := range shard {
-	//				shards[data.ID] = TransferShard{
-	//					ID: data.ID,
-	//				}
-	//				//data.Dirty = false
-	//			}
-	//		}
-	//		kv.mu.Unlock()
-	//
-	//		//op := Op{
-	//		//	Op: "finishSendingData",
-	//		//	ConfigNum: num,
-	//		//	Shards: shards,
-	//		//}
-	//		//
-	//		//kv.start(op)
-	//	}(config.Num)
-	//}
-
 	return
 }
 
@@ -574,6 +515,7 @@ func (kv *ShardKV) receiveShards(op Op) Err {
 		// 发过来的数据更新
 		if shard.ConfigNum >= kv.shardKvs[sid].ConfigNum {
 			kv.shardKvs[sid].Data = copyMap(shard.Data)
+			kv.shardKvs[sid].Clients = copyIntMap(shard.Clients)
 			kv.shardKvs[sid].ConfigNum = shard.ConfigNum
 			kv.shardKvs[sid].Dirty = false
 		} else {
@@ -597,6 +539,7 @@ func (kv *ShardKV) receiveShards(op Op) Err {
 				ShardID:   kv.shardKvs[sid].ID,
 				Dirty:     kv.shardKvs[sid].Dirty,
 				Data:      data,
+				Clients:   copyIntMap(kv.shardKvs[sid].Clients),
 				ConfigNum: kv.shardKvs[sid].ConfigNum,
 			}
 			gidOfShards[toGid] = append(gidOfShards[toGid], tts)
@@ -621,11 +564,9 @@ func (kv *ShardKV) receiveShards(op Op) Err {
 }
 
 func (kv *ShardKV) finishSendingData(op Op) Err {
-	DPrintf("server:%d, gid:%d finishSendingData shards:%v",
-		kv.me, kv.gid, op.Shards)
-	//if kv.configChangeDone[op.ConfigNum] {
-	//	return OK
-	//}
+	DPrintf("server:%d, gid:%d finishSendingData",
+		kv.me, kv.gid)
+
 	taskID := op.TaskID
 	GID := op.GID
 	task, ok := kv.taskQueue[taskID]
@@ -648,8 +589,6 @@ func (kv *ShardKV) finishSendingData(op Op) Err {
 	if len(task.GidOfShards) == 0 {
 		delete(kv.taskQueue, taskID)
 	}
-
-	//kv.configChangeDone[op.ConfigNum] = true
 
 	return OK
 }
@@ -679,7 +618,6 @@ func (kv *ShardKV) encodeHardState() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.currentConfig)
 	e.Encode(kv.shardKvs)
-	e.Encode(kv.clients)
 	e.Encode(kv.taskQueue)
 
 	data := w.Bytes()
@@ -695,19 +633,16 @@ func (kv *ShardKV) readSnapshot() {
 	var (
 		config    shardmaster.Config
 		shards    [shardmaster.NShards]*ShardData
-		clients   map[int64]int
 		taskQueue map[int]transferTask
 	)
 
 	if d.Decode(&config) != nil ||
 		d.Decode(&shards) != nil ||
-		d.Decode(&clients) != nil ||
 		d.Decode(&taskQueue) != nil {
 		log.Fatalf("readSnapshot failed, decode error")
 	} else {
 		kv.currentConfig = config
 		kv.shardKvs = shards
-		kv.clients = clients
 		kv.taskQueue = taskQueue
 	}
 }
@@ -730,9 +665,6 @@ func (kv *ShardKV) periodicFetch() {
 				break
 			}
 
-			//bs, _ := json.Marshal(kv.shardKvs)
-			//DPrintf("server:%d, gid:%d try to fetch config, shards:[%s], kv.finishSending:%v",
-			//	kv.me, kv.gid, kv.transferring, string(bs), kv.finishSending)
 			config := kv.currentConfig
 			kv.mu.Unlock()
 
@@ -749,122 +681,6 @@ func (kv *ShardKV) periodicFetch() {
 	}
 }
 
-//
-//func (kv *ShardKV) transferTask() {
-//	for {
-//		select {
-//		case <-kv.shutdown:
-//			DPrintf("periodicTransfer server:%d, gid:%d shutdown kv server", kv.me, kv.gid)
-//			return
-//		case <-kv.taskCh:
-//			kv.mu.Lock()
-//			if !kv.isLeader {
-//				kv.mu.Unlock()
-//				break
-//			}
-//
-//			config := kv.currentConfig()
-//			DPrintf("server:%d gid:%d configNum:%d begin transfer data", kv.me, kv.gid, config.Num)
-//
-//			shardMap := make(map[int][]*ShardData) // gid -> []shardData
-//			for sid, shard := range kv.shardKvs {
-//				if !shard.Responsible && shard.Own {
-//					gid := config.Shards[sid]
-//
-//					if _, ok := shardMap[gid]; !ok {
-//						shardMap[gid] = make([]*ShardData, 0)
-//					}
-//					shardMap[gid] = append(shardMap[gid], shard)
-//				}
-//			}
-//
-//			//var wg sync.WaitGroup
-//			doneCh := make([]chan struct{}, len(shardMap))
-//			for i := 0; i < len(doneCh); i++ {
-//				doneCh[i] = make(chan struct{}, 1)
-//			}
-//
-//			i := 0
-//			for gid, shards := range shardMap {
-//				allData := make(map[int]TransferShard)
-//				for _, shard := range shards {
-//					data := copyMap(shard.Data)
-//					allData[shard.ID] = TransferShard{
-//						ID:        shard.ID,
-//						ConfigNum: shard.ConfigNum,
-//						Data:      data,
-//					}
-//				}
-//				go kv.sendTransfer(doneCh[i], config.Num, gid, config.Groups[gid], allData)
-//				i++
-//			}
-//
-//			if len(shardMap) > 0 {
-//				bs, _ := json.Marshal(shardMap)
-//				DPrintf("server:%d, gid:%d transfer data, shardMap:[%s]", kv.me, kv.gid, string(bs))
-//			}
-//
-//			kv.mu.Unlock()
-//
-//			for i := 0; i < len(shardMap); i++ {
-//				select {
-//				case <-kv.shutdown:
-//					return
-//				case <-doneCh[i]:
-//
-//				}
-//			}
-//
-//			// 确保本次变更完成进行下一轮
-//			if len(shardMap) > 0 {
-//				DPrintf("server:%d, gid:%d finish transfer data one round", kv.me, kv.gid)
-//			}
-//
-//			op := Op{
-//				Op:        "finishSendingData",
-//				ConfigNum: kv.currentConfig.Num,
-//				Shards:    nil,
-//			}
-//
-//			err, _ := kv.start(op)
-//			if err != OK {
-//				log.Fatalf("server:%d, gid:%d, finishSendingData failed", kv.me, kv.gid)
-//			}
-//
-//			//for _, shard := range shardMap {
-//			//	for _, data := range shard {
-//			//		if !kv.shardKvs[data.ID].Responsible {
-//			//			kv.shardKvs[data.ID].Own = false
-//			//		}
-//			//	}
-//			//}
-//			//
-//			//// 这里还要看下所有的shards是否都已经收到了
-//			//kv.finishSending = true
-//			//kv.checkConfigChangeFinished()
-//
-//		}
-//	}
-//}
-//
-//func (kv *ShardKV) checkConfigChangeFinished() {
-//	allReceive := true
-//	for _, shard := range kv.shardKvs {
-//		if shard.Responsible && !shard.Own {
-//			allReceive = false
-//		}
-//	}
-//
-//	DPrintf("server:%d, gid:%d checkConfigChangeFinished allReceive:%v, finishSending:%v",
-//		kv.me, kv.gid, allReceive, kv.finishSending)
-//	if allReceive && kv.finishSending {
-//		DPrintf("server:%d, gid:%d checkConfigChangeFinished done, configNum:%d",
-//			kv.me, kv.gid, kv.currentConfig.Num)
-//		kv.transferring = false
-//		kv.finishSending = false
-//	}
-//}
-//
 func (kv *ShardKV) periodicTransfer() {
 
 	inflight := make(map[int]bool)
@@ -903,6 +719,7 @@ func (kv *ShardKV) periodicTransfer() {
 							Dirty:     shard.Dirty,
 							ConfigNum: shard.ConfigNum,
 							Data:      shard.Data,
+							Clients:   shard.Clients,
 						}
 
 					}
@@ -994,6 +811,14 @@ func copyMap(m map[string]string) map[string]string {
 	return res
 }
 
+func copyIntMap(m map[int64]int) map[int64]int {
+	res := make(map[int64]int)
+	for k, v := range m {
+		res[k] = v
+	}
+	return res
+}
+
 //
 // servers[] contains the ports of the servers in this group.
 //
@@ -1056,6 +881,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 			Responsible: false,
 			Own:         false,
 			Data:        make(map[string]string),
+			Clients:     make(map[int64]int),
 		}
 	}
 	kv.shutdown = make(chan struct{})
@@ -1063,7 +889,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.isLeader = false
 	kv.shardKvs = shards
-	kv.clients = make(map[int64]int)
 	kv.taskQueue = make(map[int]transferTask)
 	kv.notifyChanMap = make(map[int]chan notification)
 	nc := kv.rf.RegisterRoleChangeNotify()
@@ -1071,7 +896,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.mu.Unlock()
 	go kv.service()
 	go kv.periodicFetch()
-	//go kv.transferTask()
 	go kv.periodicTransfer()
 
 	return kv
