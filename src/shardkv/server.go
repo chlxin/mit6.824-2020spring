@@ -31,8 +31,11 @@ type Op struct {
 	ConfigNum int
 	// for config change
 	Config shardmaster.Config
-	// for receive shard, finish sending
+	// for receive shard,
 	Shards map[int]TransferShard
+	// for finish sending
+	TaskID int
+	GID    int
 }
 
 func (op Op) String() string {
@@ -68,6 +71,20 @@ type ShardData struct {
 	ConfigNum   int // 上一次写入的ConfigNum
 }
 
+type transferTask struct {
+	TaskID      int
+	ConfigNum   int
+	Groups      map[int][]string
+	GidOfShards map[int][]transferTaskShard
+}
+
+type transferTaskShard struct {
+	ShardID   int
+	Dirty     bool
+	Data      map[string]string
+	ConfigNum int
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -88,6 +105,7 @@ type ShardKV struct {
 	roleChangeCh  chan raft.RoleChange
 	shutdown      chan struct{}
 	currentConfig shardmaster.Config
+	taskQueue     map[int]transferTask
 	shardKvs      [shardmaster.NShards]*ShardData
 	clients       map[int64]int             // key:clientId, value:已经处理过的最新的requestId
 	notifyChanMap map[int]chan notification // 需要用mu来保护并发访问, key为index，一旦notify后就需要删除
@@ -146,6 +164,7 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 
 	op := Op{
 		Op:        "receiveShards",
+		GID:       args.GID,
 		ConfigNum: args.ConfigNum,
 		Shards:    args.Shards,
 	}
@@ -155,14 +174,11 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 	reply.Err = err
 }
 
-func (kv *ShardKV) sendTransfer(done chan struct{}, configNum int, gid int,
-	servers []string, data map[int]TransferShard) {
-	defer func() {
-		done <- struct{}{}
-	}()
+func (kv *ShardKV) sendTransfer(me int, configNum int, gid int,
+	servers []string, data map[int]TransferShard, taskID int) {
 	args := TransferArgs{
 		ConfigNum: configNum,
-		GID:       gid,
+		GID:       me,
 		Shards:    data,
 	}
 
@@ -175,19 +191,19 @@ func (kv *ShardKV) sendTransfer(done chan struct{}, configNum int, gid int,
 		}
 
 		if kv.killed() {
-			return
+			goto Success
 		}
 		// ... not ok, or ErrWrongLeader
 	}
-	//
-	//Success:
-	//	op := Op{
-	//		Op:        "finishSendingData",
-	//		ConfigNum: configNum,
-	//		Shards:    data,
-	//	}
-	//
-	//	kv.start(op)
+
+Success:
+	op := Op{
+		Op:     "finishSendingData",
+		TaskID: taskID,
+		GID:    gid,
+	}
+
+	kv.start(op)
 }
 
 // start 该方法的期望是使用一个独立的协程来处理，结果用notifyCh来传输，但是内部会加锁, 是不是没必要用channel接结果
@@ -468,58 +484,84 @@ func (kv *ShardKV) configChange(op Op) (value string, err Err) {
 		}
 	}
 
-	length := len(shardMap)
-	doneCh := make([]chan struct{}, length)
-	for i := 0; i < len(doneCh); i++ {
-		doneCh[i] = make(chan struct{}, 1)
-	}
-	i := 0
+	gidOfShards := make(map[int][]transferTaskShard)
 	for gid, shards := range shardMap {
-		allData := make(map[int]TransferShard)
+		allData := make([]transferTaskShard, 0)
 		for _, shard := range shards {
 			data := copyMap(shard.Data)
-			allData[shard.ID] = TransferShard{
-				ID:        shard.ID,
+			tts := transferTaskShard{
+				ShardID:   shard.ID,
 				Dirty:     shard.Dirty,
-				ConfigNum: shard.ConfigNum,
 				Data:      data,
+				ConfigNum: shard.ConfigNum,
 			}
-
+			allData = append(allData, tts)
+			// 很重要，发送之前要把该分片标记成dirty
 			shard.Dirty = true
 		}
-		DPrintf("server:%d, gid:%d transfer data to gid:%d", kv.me, kv.gid, gid)
-		if kv.isLeader {
-			go kv.sendTransfer(doneCh[i], config.Num, gid, config.Groups[gid], allData)
-		} else {
-			close(doneCh[i])
-		}
-		i++
+
+		gidOfShards[gid] = allData
 
 	}
 
-	if length > 0 {
-		bs, _ := json.Marshal(shardMap)
-		DPrintf("server:%d, gid:%d transfer data, shardMap:[%s]", kv.me, kv.gid, string(bs))
-		//DPrintf("server:%d, gid:%d finish transfer data one round", kv.me, kv.gid)
+	if len(gidOfShards) == 0 {
+		return
 	}
 
-	go func() {
-		for i := 0; i < length; i++ {
-			select {
-			case <-kv.shutdown:
-				return
-			case <-doneCh[i]:
-			}
+	taskID := int(nrand())
 
-		}
-		kv.mu.Lock()
-		for _, shard := range shardMap {
-			for _, data := range shard {
-				data.Dirty = false
-			}
-		}
-		kv.mu.Unlock()
-	}()
+	task := transferTask{
+		TaskID:      taskID,
+		Groups:      config.Groups,
+		ConfigNum:   config.Num,
+		GidOfShards: gidOfShards,
+	}
+
+	kv.taskQueue[taskID] = task
+
+	//if kv.isLeader {
+	//DPrintf("server:%d, gid:%d transfer data to gid:%d", kv.me, kv.gid, gid)
+	//go kv.sendTransfer(doneCh[i], config.Num, gid, config.Groups[gid], allData)
+	//}
+
+	//if length > 0 {
+	//	bs, _ := json.Marshal(shardMap)
+	//	DPrintf("server:%d, gid:%d transfer data, shardMap:[%s]", kv.me, kv.gid, string(bs))
+	//	//DPrintf("server:%d, gid:%d finish transfer data one round", kv.me, kv.gid)
+	//}
+
+	//if kv.isLeader {
+	//	go func(num int) {
+	//		for i := 0; i < length; i++ {
+	//			select {
+	//			case <-kv.shutdown:
+	//				return
+	//			case <-doneCh[i]:
+	//			}
+	//
+	//		}
+	//		kv.mu.Lock()
+	//
+	//		shards := make(map[int]TransferShard)
+	//		for _, shard := range shardMap {
+	//			for _, data := range shard {
+	//				shards[data.ID] = TransferShard{
+	//					ID: data.ID,
+	//				}
+	//				//data.Dirty = false
+	//			}
+	//		}
+	//		kv.mu.Unlock()
+	//
+	//		//op := Op{
+	//		//	Op: "finishSendingData",
+	//		//	ConfigNum: num,
+	//		//	Shards: shards,
+	//		//}
+	//		//
+	//		//kv.start(op)
+	//	}(config.Num)
+	//}
 
 	return
 }
@@ -527,25 +569,52 @@ func (kv *ShardKV) configChange(op Op) (value string, err Err) {
 func (kv *ShardKV) receiveShards(op Op) Err {
 	config := kv.currentConfig
 
+	gidOfShards := make(map[int][]transferTaskShard)
 	for sid, shard := range op.Shards {
 		// 发过来的数据更新
 		if shard.ConfigNum >= kv.shardKvs[sid].ConfigNum {
 			kv.shardKvs[sid].Data = copyMap(shard.Data)
 			kv.shardKvs[sid].ConfigNum = shard.ConfigNum
-
+			kv.shardKvs[sid].Dirty = false
 		} else {
-			DPrintf("server:%d, gid:%d shard config:%d < kv.shardKvs[%d].ConfigNum:%d",
-				kv.me, kv.gid, shard.ConfigNum, sid, kv.shardKvs[sid].ConfigNum)
-		}
-
-		if config.Shards[sid] != kv.gid {
-			DPrintf("server:%d, gid:%d Transfer not belong to me", kv.me, kv.gid)
+			DPrintf("server:%d, gid:%d shard config:%d < kv.shardKvs[%d].ConfigNum:%d from %d",
+				kv.me, kv.gid, shard.ConfigNum, sid, kv.shardKvs[sid].ConfigNum, op.GID)
 		}
 
 		if !shard.Dirty {
 			kv.shardKvs[sid].Own = true
+			kv.shardKvs[sid].Dirty = false
 		}
 
+		toGid := config.Shards[sid]
+		if toGid != kv.gid && kv.shardKvs[sid].Own {
+			DPrintf("server:%d, gid:%d Transfer not belong to me, it belongs to:%d", kv.me, kv.gid, config.Shards[sid])
+			if _, ok := gidOfShards[toGid]; !ok {
+				gidOfShards[toGid] = make([]transferTaskShard, 0)
+			}
+			data := copyMap(kv.shardKvs[sid].Data)
+			tts := transferTaskShard{
+				ShardID:   kv.shardKvs[sid].ID,
+				Dirty:     kv.shardKvs[sid].Dirty,
+				Data:      data,
+				ConfigNum: kv.shardKvs[sid].ConfigNum,
+			}
+			gidOfShards[toGid] = append(gidOfShards[toGid], tts)
+		}
+
+	}
+
+	if len(gidOfShards) > 0 {
+		taskID := int(nrand())
+
+		task := transferTask{
+			TaskID:      taskID,
+			Groups:      config.Groups,
+			ConfigNum:   config.Num,
+			GidOfShards: gidOfShards,
+		}
+
+		kv.taskQueue[taskID] = task
 	}
 
 	return OK
@@ -554,12 +623,33 @@ func (kv *ShardKV) receiveShards(op Op) Err {
 func (kv *ShardKV) finishSendingData(op Op) Err {
 	DPrintf("server:%d, gid:%d finishSendingData shards:%v",
 		kv.me, kv.gid, op.Shards)
-	shards := op.Shards
-
-	for _, shard := range shards {
-		kv.shardKvs[shard.ID].Dirty = false
-		kv.shardKvs[shard.ID].Dirty = false
+	//if kv.configChangeDone[op.ConfigNum] {
+	//	return OK
+	//}
+	taskID := op.TaskID
+	GID := op.GID
+	task, ok := kv.taskQueue[taskID]
+	if !ok {
+		return OK
 	}
+
+	shards, ok := task.GidOfShards[GID]
+	if !ok {
+		return OK
+	}
+	// 可以垃圾回收了，TODO
+	for _, shard := range shards {
+		if !kv.shardKvs[shard.ShardID].Responsible {
+			kv.shardKvs[shard.ShardID].Own = false
+		}
+	}
+
+	delete(task.GidOfShards, GID)
+	if len(task.GidOfShards) == 0 {
+		delete(kv.taskQueue, taskID)
+	}
+
+	//kv.configChangeDone[op.ConfigNum] = true
 
 	return OK
 }
@@ -590,6 +680,7 @@ func (kv *ShardKV) encodeHardState() []byte {
 	e.Encode(kv.currentConfig)
 	e.Encode(kv.shardKvs)
 	e.Encode(kv.clients)
+	e.Encode(kv.taskQueue)
 
 	data := w.Bytes()
 	return data
@@ -602,19 +693,22 @@ func (kv *ShardKV) readSnapshot() {
 	d := labgob.NewDecoder(r)
 
 	var (
-		config  shardmaster.Config
-		shards  [shardmaster.NShards]*ShardData
-		clients map[int64]int
+		config    shardmaster.Config
+		shards    [shardmaster.NShards]*ShardData
+		clients   map[int64]int
+		taskQueue map[int]transferTask
 	)
 
 	if d.Decode(&config) != nil ||
 		d.Decode(&shards) != nil ||
-		d.Decode(&clients) != nil {
+		d.Decode(&clients) != nil ||
+		d.Decode(&taskQueue) != nil {
 		log.Fatalf("readSnapshot failed, decode error")
 	} else {
 		kv.currentConfig = config
 		kv.shardKvs = shards
 		kv.clients = clients
+		kv.taskQueue = taskQueue
 	}
 }
 
@@ -771,106 +865,61 @@ func (kv *ShardKV) periodicFetch() {
 //	}
 //}
 //
-//func (kv *ShardKV) periodicTransfer() {
-//
-//	for {
-//		select {
-//		case <-kv.shutdown:
-//			DPrintf("periodicTransfer server:%d, gid:%d shutdown kv server", kv.me, kv.gid)
-//			return
-//		case <-time.After(300 * time.Millisecond):
-//
-//			kv.mu.Lock()
-//			if !kv.isLeader {
-//				kv.mu.Unlock()
-//				break
-//			}
-//
-//			config := kv.currentConfig()
-//
-//			shardMap := make(map[int][]*ShardData) // gid -> []shardData
-//			for sid, shard := range kv.shardKvs {
-//				if !shard.Responsible && shard.Own {
-//					gid := config.Shards[sid]
-//
-//					if _, ok := shardMap[gid]; !ok {
-//						shardMap[gid] = make([]*ShardData, 0)
-//					}
-//					shardMap[gid] = append(shardMap[gid], shard)
-//				}
-//			}
-//
-//			doneCh := make([]chan struct{}, len(shardMap))
-//			for i := 0; i < len(doneCh); i++ {
-//				doneCh[i] = make(chan struct{}, 1)
-//			}
-//
-//			i := 0
-//			for gid, shards := range shardMap {
-//				allData := make(map[int]TransferShard)
-//				for _, shard := range shards {
-//					if shard.Dirty {
-//						continue
-//					}
-//					data := copyMap(shard.Data)
-//					allData[shard.ID] = TransferShard{
-//						ID:        shard.ID,
-//						Dirty:     shard.Dirty,
-//						ConfigNum: shard.ConfigNum,
-//						Data:      data,
-//					}
-//
-//					shard.Dirty = true
-//				}
-//
-//				go kv.sendTransfer(doneCh[i], config.Num, gid, config.Groups[gid], allData)
-//				i++
-//			}
-//
-//			if len(shardMap) > 0 {
-//				bs, _ := json.Marshal(shardMap)
-//				DPrintf("server:%d, gid:%d transfer data, shardMap:[%s]", kv.me, kv.gid, string(bs))
-//			}
-//
-//			kv.mu.Unlock()
-//
-//			for i := 0; i < len(shardMap); i++ {
-//				select {
-//				case <-kv.shutdown:
-//					return
-//				case <-doneCh[i]:
-//
-//				}
-//			}
-//
-//			// 确保本次变更完成进行下一轮
-//			if len(shardMap) > 0 {
-//				DPrintf("server:%d, gid:%d finish transfer data one round", kv.me, kv.gid)
-//			}
-//
-//			kv.mu.Lock()
-//			nextConfig := kv.currentConfig
-//			// TODO: 有问题，还是要考虑下返回
-//			if nextConfig.Num > config.Num {
-//				// config发生了变化
-//				DPrintf("server:%d, gid:%d transfer config change, retry transfer", kv.me, kv.gid)
-//
-//			} else {
-//				for _, shard := range shardMap {
-//					for _, data := range shard {
-//						if !kv.shardKvs[data.ID].Responsible {
-//							kv.shardKvs[data.ID].Own = false
-//						}
-//					}
-//				}
-//			}
-//			kv.mu.Unlock()
-//
-//
-//
-//		}
-//	}
-//}
+func (kv *ShardKV) periodicTransfer() {
+
+	inflight := make(map[int]bool)
+
+	for {
+		select {
+		case <-kv.shutdown:
+			DPrintf("periodicTransfer server:%d, gid:%d shutdown kv server", kv.me, kv.gid)
+			return
+		case <-time.After(300 * time.Millisecond):
+
+			kv.mu.Lock()
+			if !kv.isLeader {
+				kv.mu.Unlock()
+				break
+			}
+
+			if len(kv.taskQueue) == 0 {
+				kv.mu.Unlock()
+				break
+			}
+
+			for _, task := range kv.taskQueue {
+				if inflight[task.TaskID] {
+					continue
+				}
+
+				gidOfShards := task.GidOfShards
+
+				for gid, shards := range gidOfShards {
+					allData := make(map[int]TransferShard)
+					for _, shard := range shards {
+
+						allData[shard.ShardID] = TransferShard{
+							ID:        shard.ShardID,
+							Dirty:     shard.Dirty,
+							ConfigNum: shard.ConfigNum,
+							Data:      shard.Data,
+						}
+
+					}
+					inflight[task.TaskID] = true
+					go kv.sendTransfer(kv.gid, task.ConfigNum, gid, task.Groups[gid], allData, task.TaskID)
+				}
+
+				bs, _ := json.Marshal(task)
+				DPrintf("server:%d, gid:%d transfer data task :[%s]", kv.me, kv.gid, string(bs))
+
+			}
+
+			kv.mu.Unlock()
+
+		}
+	}
+}
 
 //
 // the tester calls Kill() when a ShardKV instance won't
@@ -981,6 +1030,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(ShardData{})
 	labgob.Register(shardmaster.Config{})
 	labgob.Register(TransferShard{})
+	//labgob.Register(transferTask{})
 
 	setupSigusr1Trap()
 
@@ -1014,6 +1064,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.isLeader = false
 	kv.shardKvs = shards
 	kv.clients = make(map[int64]int)
+	kv.taskQueue = make(map[int]transferTask)
 	kv.notifyChanMap = make(map[int]chan notification)
 	nc := kv.rf.RegisterRoleChangeNotify()
 	kv.roleChangeCh = nc
@@ -1021,7 +1072,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.service()
 	go kv.periodicFetch()
 	//go kv.transferTask()
-	//go kv.periodicTransfer()
+	go kv.periodicTransfer()
 
 	return kv
 }
