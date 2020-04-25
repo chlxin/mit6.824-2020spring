@@ -706,7 +706,6 @@ func (rf *Raft) syncLogs(server int) {
 		nextIndex := rf.nextIndexes[server]
 		lastIncludedIndex := rf.lastIncludedIndex
 		if nextIndex <= rf.lastIncludedIndex {
-			// TODO: should send snapshot
 			args := &InstallSnapshotArgs{
 				Term:              rf.term,
 				LeaderID:          rf.me,
@@ -934,7 +933,10 @@ func (rf *Raft) getLogsRange(start, end int) []LogEntry {
 		rf.fatalf("getLogsRange illegal argument: [%d, %d]", start, end)
 	}
 
-	return rf.logs[s:e]
+	ls := rf.logs[s:e]
+	res := make([]LogEntry, len(ls))
+	copy(res, ls)
+	return res
 }
 
 func (rf *Raft) prevLog(index int) LogEntry {
