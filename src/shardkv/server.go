@@ -57,8 +57,9 @@ func (op ConfigOp) getOpType() OpType {
 }
 
 type ShardTransferOp struct {
-	Cmd   OpType
-	Shard TransferShard
+	Cmd       OpType
+	ConfigNum int
+	Shard     TransferShard
 }
 
 func (op ShardTransferOp) getOpType() OpType {
@@ -122,8 +123,8 @@ func (kv *ShardKV) StateDescription() string {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("server:%d, gid:%d Get args:[Key:%s, Client:%d]",
-		kv.me, kv.gid, args.Key, args.ClientID)
+	// DPrintf("server:%d, gid:%d Get args:[Key:%s, Client:%d]",
+	// 	kv.me, kv.gid, args.Key, args.ClientID)
 	op := ClientOp{
 		Cmd:      OpGet,
 		Key:      args.Key,
@@ -134,8 +135,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	reply.Err = err
 	reply.Value = value
-	kvInfo("server:%d, gid:%d Get args:[Key:%s, clientID:%d], result:[%v, %s]", kv,
-		kv.me, kv.gid, args.Key, args.ClientID, err, value)
+	// kvInfo("server:%d, gid:%d Get args:[Key:%s, clientID:%d], result:[%v, %s]", kv,
+	// 	kv.me, kv.gid, args.Key, args.ClientID, err, value)
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -418,10 +419,15 @@ func (kv *ShardKV) applyShardTransferOp(op ShardTransferOp) (err Err) {
 	opType := op.getOpType()
 	switch opType {
 	case OpMigrationComplete:
-		shard := kv.shardKvs[op.Shard.ID]
-		shard.State = NotStore
-		shard.Clients = make(map[int64]int)
-		shard.Data = make(map[string]string)
+		if kv.currentConfig.Num == op.ConfigNum {
+			kvInfo("OpMigrationComplete clean sid:%d", kv, op.Shard.ID)
+			shard := kv.shardKvs[op.Shard.ID]
+			shard.State = NotStore
+			shard.Clients = make(map[int64]int)
+			shard.Data = make(map[string]string)
+		} else {
+			kvInfo("OpMigrationComplete configNum:%d", kv, kv.currentConfig.Num)
+		}
 
 	case OpShardTransfer:
 		shard := kv.shardKvs[op.Shard.ID]
@@ -459,6 +465,8 @@ func (kv *ShardKV) transferShard(sid int, config shardmaster.Config) {
 	// 这里只有leader才能往下走，去与其他raft group的leader来沟通。
 	// 此处更严谨的做法是循环不断看当前shard的状态并查看自己是否变成了leader，防止其他本group的leader由于网络原因不是leader了
 	// 但是太复杂了，先不这么搞
+	time.Sleep(5 * time.Second)
+
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		return
 	}
@@ -485,11 +493,15 @@ func (kv *ShardKV) transferShard(sid int, config shardmaster.Config) {
 			srv := kv.make_end(servers[si])
 			var reply TransferReply
 			ok := srv.Call("ShardKV.Transfer", &args, &reply)
-			kvInfo("[configNum:%d] Sending shard %d to client: %s, ok:%v, err:%v",
-				kv, config.Num, sid, servers[si], ok, reply.Err)
+			// kvInfo("[configNum:%d] Sending shard %d to client: %s, ok:%v, err:%v",
+			// 	kv, config.Num, sid, servers[si], ok, reply.Err)
 			if ok && reply.Err == OK {
 				kvInfo("Shard: %d successfully transferred", kv, sid)
-				err, _ := kv.start(ShardTransferOp{Cmd: OpMigrationComplete, Shard: TransferShard{ID: sid}})
+				err, _ := kv.start(ShardTransferOp{
+					Cmd:       OpMigrationComplete,
+					ConfigNum: config.Num,
+					Shard:     TransferShard{ID: sid},
+				})
 				if err != OK {
 					kvInfo("ShardTransferOp failed", kv)
 				}
@@ -738,6 +750,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.masters = masters
+	atomic.StoreInt32(&kv.dead, 0)
 
 	// Your initialization code here.
 
@@ -771,6 +784,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.roleChangeCh = nc
 
 	// 处理异常退出遗留的问题
+
 	for _, shard := range kv.shardKvs {
 		if shard.State == MigratingData {
 			kvInfo("sid:%d continue to transfer", kv, shard.ID)
