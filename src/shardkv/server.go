@@ -224,6 +224,31 @@ func (kv *ShardKV) startClientOp(op ClientOp) (err Err, value string) {
 	return
 }
 
+func (kv *ShardKV) startConfigOp(op ConfigOp) (err Err) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		err = ErrWrongLeader
+		return
+	}
+	err = OK
+	kv.mu.Lock()
+	shardTransferInProgress := false
+	for _, shard := range kv.shardKvs {
+		if shard.State == MigratingData || shard.State == AwaitingData {
+			shardTransferInProgress = true
+			break
+		}
+	}
+	kv.mu.Unlock()
+
+	if shardTransferInProgress {
+		err = ErrMovingShard
+		return
+	}
+
+	err, _ = kv.start(op)
+	return
+}
+
 // start 该方法的期望是使用一个独立的协程来处理，结果用notifyCh来传输，但是内部会加锁, 是不是没必要用channel接结果
 func (kv *ShardKV) start(op Op) (err Err, value string) {
 	err, value = OK, ""
@@ -289,6 +314,14 @@ func (kv *ShardKV) service() {
 				// bs, _ := json.Marshal(msg.Command)
 				// kvInfo("applyMsg, msg：[index:%d, command:%s]", kv,
 				// 	msg.CommandIndex, string(bs))
+				if msg.CommandIndex%50 == 0 {
+					kvInfo("apply msg index [%d]", kv, msg.CommandIndex)
+				}
+				if msg.CommandIndex > 1000 {
+					bs, _ := json.Marshal(msg.Command)
+					kvInfo("applyMsg, msg：[index:%d, command:%s]", kv,
+						msg.CommandIndex, string(bs))
+				}
 				kv.applyMsg(msg)
 			} else {
 				// 可能是一些事件
@@ -419,15 +452,11 @@ func (kv *ShardKV) applyShardTransferOp(op ShardTransferOp) (err Err) {
 	opType := op.getOpType()
 	switch opType {
 	case OpMigrationComplete:
-		if kv.currentConfig.Num == op.ConfigNum {
-			kvInfo("OpMigrationComplete clean sid:%d", kv, op.Shard.ID)
-			shard := kv.shardKvs[op.Shard.ID]
-			shard.State = NotStore
-			shard.Clients = make(map[int64]int)
-			shard.Data = make(map[string]string)
-		} else {
-			kvInfo("OpMigrationComplete configNum:%d", kv, kv.currentConfig.Num)
-		}
+		kvInfo("OpMigrationComplete clean sid:%d", kv, op.Shard.ID)
+		shard := kv.shardKvs[op.Shard.ID]
+		shard.State = NotStore
+		shard.Clients = make(map[int64]int)
+		shard.Data = make(map[string]string)
 
 	case OpShardTransfer:
 		shard := kv.shardKvs[op.Shard.ID]
@@ -462,10 +491,6 @@ func (kv *ShardKV) createShardIfNeeded(sid int, config shardmaster.Config) {
 
 // deleteShard 内部有可能阻塞的操作，期望在一个单独的协程中跑
 func (kv *ShardKV) transferShard(sid int, config shardmaster.Config) {
-	// 这里只有leader才能往下走，去与其他raft group的leader来沟通。
-	// 此处更严谨的做法是循环不断看当前shard的状态并查看自己是否变成了leader，防止其他本group的leader由于网络原因不是leader了
-	// 但是太复杂了，先不这么搞
-	time.Sleep(8 * time.Second)
 
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		return
@@ -614,7 +639,7 @@ func (kv *ShardKV) periodicFetch() {
 					var err Err
 					for err != OK {
 						op := ConfigOp{Cmd: OpConfigUpdate, Config: c}
-						kv.start(op)
+						kv.startConfigOp(op)
 						kv.mu.Lock()
 						if kv.currentConfig.Num == c.Num {
 							err = OK
@@ -643,7 +668,6 @@ func (kv *ShardKV) Kill() {
 	// Your code here, if desired.
 	close(kv.shutdown)
 	// 需要cleanup，清除一下notifyChanMap
-	DPrintf("server:%d, gid:%d, begin cleanup", kv.me, kv.gid)
 	kv.mu.Lock()
 	DPrintf("server:%d, gid:%d, cleanup", kv.me, kv.gid)
 	kv.cleanup()
@@ -784,11 +808,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.roleChangeCh = nc
 
 	// 处理异常退出遗留的问题
-
 	for _, shard := range kv.shardKvs {
 		if shard.State == MigratingData {
 			kvInfo("sid:%d continue to transfer", kv, shard.ID)
-			go kv.transferShard(shard.ID, kv.currentConfig)
+			go kv.continueTransferShard(shard.ID, kv.currentConfig)
 		} else if shard.State == AwaitingData {
 			kvInfo("sid:%d continue to waiting", kv, shard.ID)
 			go kv.createShardIfNeeded(shard.ID, kv.currentConfig)
@@ -802,4 +825,25 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	DPrintf("Started group: %d, on node: %d", gid, me)
 
 	return kv
+}
+
+func (kv *ShardKV) continueTransferShard(sid int, config shardmaster.Config) {
+	// 这里只有leader才能往下走，去与其他raft group的leader来沟通。
+	// 此处更严谨的做法是循环不断看当前shard的状态并查看自己是否变成了leader，防止其他本group的leader由于网络原因不是leader了
+	// 但是太复杂了，先不这么搞
+	_, isLeader := kv.rf.GetState()
+
+	for !isLeader {
+		// check shard state
+		kv.mu.Lock()
+		if kv.shardKvs[sid].State != MigratingData {
+			kv.mu.Unlock()
+			return
+		}
+		kv.mu.Unlock()
+		time.Sleep(3 * time.Second)
+		_, isLeader = kv.rf.GetState()
+	}
+
+	kv.transferShard(sid, config)
 }

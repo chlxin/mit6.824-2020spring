@@ -1111,6 +1111,13 @@ func (rf *Raft) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCh
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	// rf.mu.Lock()
+	// if rf.role == leader {
+	// 	bs, _ := json.Marshal(rf.logs)
+	// 	log.Printf("me:%d raft logs (%s) !!!!!!!!!!!!!!\n", rf.me, string(bs))
+	// }
+
+	// rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
