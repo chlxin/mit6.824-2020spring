@@ -104,6 +104,7 @@ type ShardKV struct {
 
 	isLeader bool
 
+	cacheConfig   map[int]shardmaster.Config
 	roleChangeCh  chan raft.RoleChange
 	shutdown      chan struct{}
 	configNum     int64
@@ -317,11 +318,7 @@ func (kv *ShardKV) service() {
 				if msg.CommandIndex%50 == 0 {
 					kvInfo("apply msg index [%d]", kv, msg.CommandIndex)
 				}
-				if msg.CommandIndex > 1000 {
-					bs, _ := json.Marshal(msg.Command)
-					kvInfo("applyMsg, msg：[index:%d, command:%s]", kv,
-						msg.CommandIndex, string(bs))
-				}
+
 				kv.applyMsg(msg)
 			} else {
 				// 可能是一些事件
@@ -426,6 +423,7 @@ func (kv *ShardKV) applyConfigOp(op ConfigOp) (err Err) {
 		return
 	}
 	kv.currentConfig = copyConfig(op.Config)
+	kv.cacheConfig[op.Config.Num] = copyConfig(op.Config)
 	bs, _ := json.Marshal(kv.currentConfig)
 	kvInfo("apply configNum:%d, config:%s", kv, kv.currentConfig.Num, string(bs))
 	atomic.StoreInt64(&kv.configNum, int64(kv.currentConfig.Num))
@@ -435,8 +433,8 @@ func (kv *ShardKV) applyConfigOp(op ConfigOp) (err Err) {
 		if gid == kv.gid && shard.State == NotStore {
 			kvInfo("Configuration change: Now owner of shard %d", kv, sid)
 			shard.State = AwaitingData
-			// 由于是异步创建并初始化shard，有可能还没成功server就被kill
-			go kv.createShardIfNeeded(sid, kv.currentConfig)
+
+			kv.createShardIfNeeded(sid, kv.currentConfig)
 		} else if gid != kv.gid && shard.State == Available {
 			kvInfo("Configuration change: No longer owner of shard %d", kv, sid)
 			shard.State = MigratingData
@@ -444,6 +442,12 @@ func (kv *ShardKV) applyConfigOp(op ConfigOp) (err Err) {
 		}
 	}
 
+	states := make([]string, 0)
+	for _, shard := range kv.shardKvs {
+		states = append(states, string(shard.State))
+	}
+	bs, _ = json.Marshal(states)
+	kvInfo("shards state: [%s]", kv, string(bs))
 	return
 }
 
@@ -476,17 +480,25 @@ func (kv *ShardKV) createShardIfNeeded(sid int, config shardmaster.Config) {
 	// 进入到这个方法的前提是当前没有sid的shard的数据，即状态为NotStore
 	lastConfig := config
 	for lastConfig.Num > 1 && lastConfig.Shards[sid] == kv.gid {
-		lastConfig = kv.mck.Query(lastConfig.Num - 1)
+		lastConfig = kv.queryConfig(lastConfig.Num - 1)
 	}
 
 	if lastConfig.Num == 1 && lastConfig.Shards[sid] == kv.gid {
-		kv.mu.Lock()
+		// kv.mu.Lock()
 		kvInfo("Creating new shard: %d", kv, sid)
 		kv.createShard(sid)
-		kv.mu.Unlock()
+		// kv.mu.Unlock()
 	} else {
 		kvInfo("Awaiting data for shard: %d from %d [configNum:%d]", kv, sid, lastConfig.Shards[sid], config.Num)
 	}
+}
+
+func (kv *ShardKV) queryConfig(num int) shardmaster.Config {
+	if config, ok := kv.cacheConfig[num]; ok {
+		return config
+	}
+	config := kv.mck.Query(num)
+	return config
 }
 
 // deleteShard 内部有可能阻塞的操作，期望在一个单独的协程中跑
@@ -803,6 +815,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.shardKvs = shards
 	}
 
+	kv.cacheConfig = make(map[int]shardmaster.Config)
 	kv.notifyChanMap = make(map[int]chan notification)
 	nc := kv.rf.RegisterRoleChangeNotify()
 	kv.roleChangeCh = nc
@@ -812,10 +825,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		if shard.State == MigratingData {
 			kvInfo("sid:%d continue to transfer", kv, shard.ID)
 			go kv.continueTransferShard(shard.ID, kv.currentConfig)
-		} else if shard.State == AwaitingData {
-			kvInfo("sid:%d continue to waiting", kv, shard.ID)
-			go kv.createShardIfNeeded(shard.ID, kv.currentConfig)
 		}
+		// else if shard.State == AwaitingData {
+		// 	kvInfo("sid:%d continue to waiting", kv, shard.ID)
+		// 	go kv.createShardIfNeeded(shard.ID, kv.currentConfig)
+		// }
 	}
 
 	kv.mu.Unlock()
