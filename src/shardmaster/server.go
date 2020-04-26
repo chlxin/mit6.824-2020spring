@@ -285,13 +285,19 @@ func (sm *ShardMaster) join(servers map[int][]string) Config {
 	current := sm.configs[len(sm.configs)-1]
 	num := current.Num + 1
 	groups := mergeMap(current.Groups, servers)
-	shards := assignShards(groups)
+	shards := [NShards]int{}
+	for i, s := range current.Shards {
+		shards[i] = s
+	}
+
 	next := Config{
 		Num:    num,
 		Shards: shards,
 		Groups: groups,
 	}
-
+	// bs, _ := json.Marshal(next)
+	// fmt.Println(string(bs))
+	rebalanceShards(&next)
 	DPrintf("servers:%v, next:%v", servers, next)
 	return next
 }
@@ -304,12 +310,30 @@ func (sm *ShardMaster) leave(gIDs []int) Config {
 	for _, gID := range gIDs {
 		delete(groups, gID)
 	}
-	shards := assignShards(groups)
+	shards := [NShards]int{}
+	for i, s := range current.Shards {
+		exist := false
+		for _, gid := range gIDs {
+			if s == gid {
+				exist = true
+				break
+			}
+		}
+		if exist {
+			shards[i] = 0
+		} else {
+			shards[i] = s
+		}
+
+	}
+
 	next := Config{
 		Num:    num,
 		Shards: shards,
 		Groups: groups,
 	}
+
+	rebalanceShards(&next)
 
 	return next
 }
@@ -360,6 +384,80 @@ func mergeMap(m map[int][]string, servers map[int][]string) map[int][]string {
 		nm[k] = vc
 	}
 	return nm
+}
+
+func rebalanceShards(config *Config) {
+	if len(config.Groups) == 0 {
+		for sid := range config.Shards {
+			config.Shards[sid] = 0
+		}
+		return
+	}
+
+	minShardsPerGroup := NShards / len(config.Groups)
+	distribution := make(map[int][]int) // Find the current distribution of GID -> shards
+	unassignedShards := make([]int, 0)
+
+	for gid := range config.Groups {
+		distribution[gid] = make([]int, 0)
+	}
+
+	for shard, gid := range config.Shards {
+		if gid != 0 {
+			distribution[gid] = append(distribution[gid], shard)
+		} else {
+			unassignedShards = append(unassignedShards, shard)
+		}
+	}
+
+	areShardsBalanced := func() bool { // Helper to determine if all shards are assigned + balanced across groups
+		sum := 0
+		for gid := range distribution {
+			shardCount := len(distribution[gid])
+			if shardCount < minShardsPerGroup {
+				return false
+			}
+			sum += shardCount
+		}
+		return sum == NShards
+	}
+
+	for !areShardsBalanced() {
+		for gid := range distribution {
+			// If this group is under capacity, add as many shards as we can to it from the unassigned
+			for len(unassignedShards) > 0 && len(distribution[gid]) < minShardsPerGroup {
+				distribution[gid] = append(distribution[gid], unassignedShards[0])
+				unassignedShards = unassignedShards[1:]
+			}
+
+			// If there aren't any unassigned shards and group is under-capacity, "steal" shard from an over-capacity group
+			if len(unassignedShards) == 0 && len(distribution[gid]) < minShardsPerGroup {
+				for gid2 := range distribution {
+					if len(distribution[gid2]) > minShardsPerGroup {
+						distribution[gid] = append(distribution[gid], distribution[gid2][0])
+						distribution[gid2] = distribution[gid2][1:]
+						break
+					}
+				}
+			}
+		}
+
+		// If we still have unassigned shards, assign them one by one to each group
+		for gid := range distribution {
+			if len(unassignedShards) > 0 {
+				distribution[gid] = append(distribution[gid], unassignedShards[0])
+				unassignedShards = unassignedShards[1:]
+			}
+		}
+	}
+
+	// Assign distribution to config
+	for gid, shards := range distribution {
+		for _, i := range shards {
+			config.Shards[i] = gid
+		}
+	}
+
 }
 
 func assignShards(groups map[int][]string) [NShards]int {

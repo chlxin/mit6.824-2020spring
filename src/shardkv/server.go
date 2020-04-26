@@ -294,7 +294,7 @@ func (kv *ShardKV) service() {
 				// 可能是一些事件
 				if cmd, ok := msg.Command.(string); ok {
 					if cmd == "installSnapshot" {
-						DPrintf("server:%d snapshot", kv.me)
+						// DPrintf("server:%d snapshot", kv.me)
 						kv.mu.Lock()
 						kv.readSnapshot()
 						kv.mu.Unlock()
@@ -465,7 +465,7 @@ func (kv *ShardKV) transferShard(sid int, config shardmaster.Config) {
 	// 这里只有leader才能往下走，去与其他raft group的leader来沟通。
 	// 此处更严谨的做法是循环不断看当前shard的状态并查看自己是否变成了leader，防止其他本group的leader由于网络原因不是leader了
 	// 但是太复杂了，先不这么搞
-	time.Sleep(5 * time.Second)
+	time.Sleep(8 * time.Second)
 
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		return
@@ -574,7 +574,7 @@ func (kv *ShardKV) readSnapshot() {
 		kv.currentConfig = config
 		atomic.StoreInt64(&kv.configNum, int64(kv.currentConfig.Num))
 		kv.shardKvs = shards
-		DPrintf("gid:%d server:%d readsnpashot, config:%d", kv.gid, kv.me, kv.currentConfig.Num)
+		// DPrintf("gid:%d server:%d readsnpashot, config:%d", kv.gid, kv.me, kv.currentConfig.Num)
 	}
 
 }
