@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = 1
+const Debug = 0
 const LogMasterOnly = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {

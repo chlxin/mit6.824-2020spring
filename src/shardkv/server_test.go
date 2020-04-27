@@ -7,6 +7,7 @@ import (
 )
 
 func Test_copyConfig(t *testing.T) {
+	t.Skip()
 	c := shardmaster.Config{
 		Num:    10,
 		Shards: [10]int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
@@ -17,6 +18,7 @@ func Test_copyConfig(t *testing.T) {
 }
 
 func Test_11(t *testing.T) {
+	t.Skip()
 	sid := key2shard("0")
 	fmt.Println(sid)
 }

@@ -163,8 +163,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	err, _ := kv.start(op)
 
 	reply.Err = err
-	// kvInfo("server:%d, gid:%d PutAppend args:[Key:%s, value:%s, Client:%d, requestID:%d], result:[%v]", kv,
-	// 	kv.me, kv.gid, args.Key, args.Value, args.ClientID, args.RequestID, err)
+	kvInfo("server:%d, gid:%d PutAppend args:[Key:%s, value:%s, Client:%d, requestID:%d], result:[%v]", kv,
+		kv.me, kv.gid, args.Key, args.Value, args.ClientID, args.RequestID, err)
 }
 
 func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
@@ -315,9 +315,9 @@ func (kv *ShardKV) service() {
 				// bs, _ := json.Marshal(msg.Command)
 				// kvInfo("applyMsg, msg：[index:%d, command:%s]", kv,
 				// 	msg.CommandIndex, string(bs))
-				if msg.CommandIndex%50 == 0 {
-					kvInfo("apply msg index [%d]", kv, msg.CommandIndex)
-				}
+				// if msg.CommandIndex%50 == 0 {
+				// 	kvInfo("apply msg index [%d]", kv, msg.CommandIndex)
+				// }
 
 				kv.applyMsg(msg)
 			} else {
@@ -456,11 +456,16 @@ func (kv *ShardKV) applyShardTransferOp(op ShardTransferOp) (err Err) {
 	opType := op.getOpType()
 	switch opType {
 	case OpMigrationComplete:
-		kvInfo("OpMigrationComplete clean sid:%d", kv, op.Shard.ID)
-		shard := kv.shardKvs[op.Shard.ID]
-		shard.State = NotStore
-		shard.Clients = make(map[int64]int)
-		shard.Data = make(map[string]string)
+		if op.ConfigNum == kv.currentConfig.Num {
+			kvInfo("OpMigrationComplete clean sid:%d", kv, op.Shard.ID)
+			shard := kv.shardKvs[op.Shard.ID]
+			shard.State = NotStore
+			shard.Clients = make(map[int64]int)
+			shard.Data = make(map[string]string)
+		} else {
+			kvInfo("OpMigrationComplete try to clean ,but op.ConfigNum[%d] != currentCongi:[%d]", kv,
+				op.ConfigNum, kv.currentConfig.Num)
+		}
 
 	case OpShardTransfer:
 		shard := kv.shardKvs[op.Shard.ID]

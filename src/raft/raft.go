@@ -999,6 +999,10 @@ func (rf *Raft) Snapshot(lastCommandIndex int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if lastCommandIndex < rf.lastIncludedIndex {
+		return
+	}
+
 	index := rf.indexOf(lastCommandIndex)
 	if index <= 0 {
 		rf.fatalf("Snapshot failed, lastCommandInex:%d illegal", lastCommandIndex)
