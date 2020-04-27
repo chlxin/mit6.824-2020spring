@@ -706,7 +706,6 @@ func (rf *Raft) syncLogs(server int) {
 		nextIndex := rf.nextIndexes[server]
 		lastIncludedIndex := rf.lastIncludedIndex
 		if nextIndex <= rf.lastIncludedIndex {
-			// TODO: should send snapshot
 			args := &InstallSnapshotArgs{
 				Term:              rf.term,
 				LeaderID:          rf.me,
@@ -934,7 +933,10 @@ func (rf *Raft) getLogsRange(start, end int) []LogEntry {
 		rf.fatalf("getLogsRange illegal argument: [%d, %d]", start, end)
 	}
 
-	return rf.logs[s:e]
+	ls := rf.logs[s:e]
+	res := make([]LogEntry, len(ls))
+	copy(res, ls)
+	return res
 }
 
 func (rf *Raft) prevLog(index int) LogEntry {
@@ -996,6 +998,10 @@ func (rf *Raft) clearSnapshot() {
 func (rf *Raft) Snapshot(lastCommandIndex int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if lastCommandIndex < rf.lastIncludedIndex {
+		return
+	}
 
 	index := rf.indexOf(lastCommandIndex)
 	if index <= 0 {
@@ -1109,6 +1115,13 @@ func (rf *Raft) consistentCheck(prevLogIndex int, prevLogTerm int) *consistentCh
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	// rf.mu.Lock()
+	// if rf.role == leader {
+	// 	bs, _ := json.Marshal(rf.logs)
+	// 	log.Printf("me:%d raft logs (%s) !!!!!!!!!!!!!!\n", rf.me, string(bs))
+	// }
+
+	// rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {

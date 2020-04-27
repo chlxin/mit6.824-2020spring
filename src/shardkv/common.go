@@ -10,10 +10,12 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK               = "OK"
+	ErrNoKey         = "ErrNoKey"
+	ErrWrongGroup    = "ErrWrongGroup"
+	ErrWrongLeader   = "ErrWrongLeader"
+	ErrMovingShard   = "ErrMovingShard"
+	ErrWaitingConfig = "ErrWaitingConfig"
 )
 
 type Err string
@@ -29,7 +31,6 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	ClientID  int64
 	RequestID int
-	ConfigNum int
 }
 
 type PutAppendReply struct {
@@ -39,8 +40,7 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
-	ClientID  int64
-	ConfigNum int
+	ClientID int64
 }
 
 type GetReply struct {
@@ -50,8 +50,8 @@ type GetReply struct {
 
 type TransferArgs struct {
 	ConfigNum int
-	GID       int
-	Shards    map[int]TransferShard
+	From      int
+	Shard     TransferShard
 }
 
 type TransferReply struct {
@@ -59,9 +59,7 @@ type TransferReply struct {
 }
 
 type TransferShard struct {
-	ID        int
-	ConfigNum int
-	Dirty     bool
-	Data      map[string]string
-	Clients   map[int64]int
+	ID      int
+	Data    map[string]string
+	Clients map[int64]int
 }
